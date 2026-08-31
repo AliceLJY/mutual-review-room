@@ -47,16 +47,17 @@ adapter。
 | Codex owner | 已验证 | 房间启动成功，并从 owner 沙盒内部发出派发命令 |
 | Kimi reviewer | 已验证 | 两轮，原生会话 ID 保持不变 |
 | Codex reviewer | 已验证 | 两轮，原生会话 ID 保持不变 |
-| Claude owner | 部分验证 | 0.1.1 补测：启动与契约加载成功，派发未验证 |
+| Claude owner | 已验证 | 完整 round 1：启动、契约加载、发出派发、两位 reviewer 各自作答 |
 | Claude reviewer | **未验证** | 尚未跑过真实调用 |
 
 Claude adapter 有自动化测试覆盖。0.1.0 验收时该账号触发限流（HTTP 429），
-Claude 侧两个角色都没验成；2026-08-31 在 0.1.1 上补测了 Claude owner：房间
-启动、owner 契约加载与交互式接管都成功，没有再撞限流，但契约加载那一轮耗时
-约 4 分 24 秒（Codex 走同一步是秒级），期间记录到一次
-`model_refusal_fallback`。从 owner 发出派发命令这一步仍未验证，Claude
-reviewer 也尚未跑过真实调用，因此在你自己验过之前请把 Claude 侧当作实验性
-功能。
+Claude 侧两个角色都没验成；2026-09-01 在 0.1.1 上补测了 Claude owner，跑完
+一整轮 round 1：房间启动、owner 契约加载与交互式接管、由 owner 发出
+`dispatch-all`、codex 与 kimi 两位 reviewer 各自独立作答并回到 owner，全部
+成功，没有再撞限流。唯一的粗糙处是契约加载那一轮偏慢，两次实测分别为
+4 分 24 秒与 2 分 29 秒（Codex 走同一步是秒级），第一次还记录到一次
+`model_refusal_fallback`。终审（`complete`）这一步与 Claude reviewer 都还
+没跑过真实调用，那两处仍需你自己验。
 
 ## 安装
 
