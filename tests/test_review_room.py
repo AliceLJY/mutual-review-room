@@ -426,6 +426,34 @@ class ReviewRoomTests(unittest.TestCase):
         self.assertNotIn(room.session_name, runner.sessions)
         self.assertEqual(1, len(runner.commands("kill-session")))
 
+    def test_hidden_broker_starts_before_the_sandboxed_owner(self):
+        runner = FakeRunner()
+        room = TmuxRoom("job-with-broker", runner=runner, tmux_bin="tmux")
+
+        room.create(
+            ["codex", "resume", "owner-session"],
+            [["python3", "-m", "mutual_review_room.cli", "observe"]],
+            broker_argv=[
+                "python3",
+                "-m",
+                "mutual_review_room.cli",
+                "broker",
+                "--job",
+                "job-with-broker",
+            ],
+        )
+
+        broker = runner.commands("new-window")
+        self.assertEqual(1, len(broker))
+        self.assertIn("broker --job job-with-broker", broker[0][-1])
+        self.assertNotIn("prompt", broker[0][-1])
+        command_names = [call[0][5] for call in runner.calls]
+        self.assertLess(
+            command_names.index("new-window"),
+            command_names.index("respawn-pane"),
+        )
+        self.assertEqual(1, len(runner.commands("select-window")))
+
     def test_projection_explains_mouse_scrollback_without_keyboard_chords(self):
         rendered = render_reviewer(FakeStore(), "codex")
 

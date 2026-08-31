@@ -15,6 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - run: brew install tmux
       - run: python -m pip install --upgrade pip
       - run: python -m pip install . "ruff>=0.15,<0.16"
       - run: ruff check .

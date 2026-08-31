@@ -1170,8 +1170,8 @@ class ReviewState:
             raise NotFoundError(f"job not found: {job_id}")
         if not _is_regular_file(db_path):
             raise NotFoundError(f"job database not found: {job_id}")
-        os.chmod(job_dir, 0o700)
-        os.chmod(db_path, 0o600)
+        _enforce_mode(job_dir, 0o700)
+        _enforce_mode(db_path, 0o600)
         connection = sqlite3.connect(db_path, timeout=5.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -1267,7 +1267,7 @@ class ReviewState:
         if path.exists() and (path.is_symlink() or not path.is_dir()):
             raise ValidationError(f"private state path is not a real directory: {path}")
         path.mkdir(parents=True, mode=0o700, exist_ok=True)
-        os.chmod(path, 0o700)
+        _enforce_mode(path, 0o700)
 
 
 def _coerce_reviewer_spec(value: ReviewerSpec | Mapping[str, Any]) -> ReviewerSpec:
@@ -1380,6 +1380,19 @@ def _is_regular_file(path: Path) -> bool:
         return not path.is_symlink() and stat.S_ISREG(path.stat().st_mode)
     except FileNotFoundError:
         return False
+
+
+def _enforce_mode(path: Path, mode: int) -> None:
+    """Require ``mode`` without writing when the mode is already correct.
+
+    A read-only consumer such as ``status`` must be able to open the control
+    root from a sandbox that denies writes to it.  An unconditional ``chmod``
+    fails there even though it would not have changed anything, so the metadata
+    write only happens when the mode actually differs.
+    """
+
+    if stat.S_IMODE(os.lstat(path).st_mode) != mode:
+        os.chmod(path, mode)
 
 
 def _job_from_row(row: sqlite3.Row) -> ReviewJob:

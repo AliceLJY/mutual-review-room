@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import resource
@@ -14,8 +15,19 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
+from .broker import (
+    BrokerError,
+    BrokerResponse,
+    BrokerUnavailable,
+    MailboxSecurityError,
+    mailbox_paths,
+    prepare_mailbox,
+    serve_forever,
+    submit as submit_broker_request,
+    wait as wait_for_broker,
+)
 from .room import TmuxRoom, TmuxRoomError, observe_reviewer
 from .runtime import (
     ProviderFailed,
@@ -101,24 +113,40 @@ def _read_verdict(args: argparse.Namespace) -> str:
     return verdict
 
 
-def _token_path(state: ReviewState, job_id: str, supplied: str | None) -> Path:
+def _authorize(state: ReviewState, job_id: str, token_file: str | None) -> None:
+    """Accept the same owner authority the broker clients accept.
+
+    The native owner launcher removes ``MRR_OWNER_TOKEN_FILE`` and injects
+    ``MRR_OWNER_TOKEN`` instead, so a file-only check can never succeed inside
+    the owner pane.
+    """
+
+    token = _client_token(state.root, job_id, token_file)
+    if not state.verify_owner_token(job_id, token):
+        raise CliError("owner control token is invalid")
+
+
+def _client_token(root: Path, job_id: str, supplied: str | None) -> str:
+    """Read owner authority without making the sandboxed client open SQLite."""
+
+    environment_token = os.environ.get("MRR_OWNER_TOKEN")
+    if supplied is None and environment_token:
+        token = environment_token.strip()
+        if token:
+            return token
     configured = supplied or os.environ.get("MRR_OWNER_TOKEN_FILE")
     if not configured:
-        raise CliError("owner control token file is not configured")
-    expected = (state.root / job_id / "owner.token").resolve()
+        raise CliError("owner control token is not configured")
+    expected = (root / job_id / "owner.token").resolve()
     candidate = Path(configured).expanduser()
     if candidate.is_symlink() or not candidate.is_file():
         raise CliError("owner control token file is unavailable")
     if candidate.resolve() != expected:
         raise CliError("owner control token file does not belong to this job")
-    return candidate
-
-
-def _authorize(state: ReviewState, job_id: str, token_file: str | None) -> None:
-    path = _token_path(state, job_id, token_file)
-    token = path.read_text(encoding="utf-8").strip()
-    if not state.verify_owner_token(job_id, token):
+    token = candidate.read_text(encoding="utf-8").strip()
+    if not token:
         raise CliError("owner control token is invalid")
+    return token
 
 
 @contextmanager
@@ -305,6 +333,101 @@ def dispatch_one(
         }
 
 
+def _round_request_id(job_id: str, reviewer_id: str, round_no: int) -> str:
+    material = f"{job_id}\0{reviewer_id}\0{round_no}".encode("utf-8")
+    return f"req_{hashlib.sha256(material).hexdigest()[:32]}"
+
+
+def _dispatch_all_local(
+    state: ReviewState,
+    job_id: str,
+    *,
+    round_no: int,
+    prompt: str,
+    timeout: float,
+) -> dict[str, Any]:
+    """Run one serial fan-out inside the native broker process."""
+
+    job = state.get_job(job_id)
+    if job.status in {"complete", "failed"}:
+        raise StateConflictError(f"job is already {job.status}")
+    if not 1 <= round_no <= min(job.max_rounds, 3):
+        raise ValidationError(
+            f"round {round_no} exceeds job maximum {job.max_rounds}"
+        )
+    reviewers = state.list_reviewers(job_id)
+    queued = [
+        reviewer
+        for reviewer in reviewers
+        if reviewer.status not in {"unavailable", "running"}
+        and reviewer.current_round + 1 == round_no
+    ]
+    for position, reviewer in enumerate(queued, start=1):
+        existing = state.list_events(
+            job_id,
+            reviewer_id=reviewer.reviewer_id,
+            event_type="request_queued",
+        )
+        if any(event.round == round_no for event in existing):
+            continue
+        state.append_event(
+            job_id,
+            reviewer_id=reviewer.reviewer_id,
+            session_id=reviewer.native_session_id,
+            round=round_no,
+            direction="system",
+            event_type="request_queued",
+            status="queued",
+            content=(
+                f"Queued for serial dispatch ({position}/{len(queued)}); "
+                "the provider has not started."
+            ),
+        )
+    # Only eligible lanes are dispatched, but an ineligible lane is still
+    # reported so the owner can see why it did not take part in this round.
+    eligible = {reviewer.reviewer_id for reviewer in queued}
+    results: list[dict[str, Any]] = [
+        {
+            "job_id": job_id,
+            "reviewer_id": reviewer.reviewer_id,
+            "round": round_no,
+            "status": "skipped",
+            "reason": (
+                f"lane is {reviewer.status} at round {reviewer.current_round}; "
+                f"round {round_no} is not its next round"
+            ),
+        }
+        for reviewer in reviewers
+        if reviewer.reviewer_id not in eligible
+    ]
+    for reviewer in queued:
+        try:
+            results.append(
+                dispatch_one(
+                    state,
+                    job_id,
+                    reviewer.reviewer_id,
+                    round_no=round_no,
+                    prompt=prompt,
+                    timeout=timeout,
+                    request_id=_round_request_id(
+                        job_id, reviewer.reviewer_id, round_no
+                    ),
+                )
+            )
+        except ReviewStateError as error:
+            results.append(
+                {
+                    "job_id": job_id,
+                    "reviewer_id": reviewer.reviewer_id,
+                    "round": round_no,
+                    "status": "failed",
+                    "reason": str(error),
+                }
+            )
+    return {"job_id": job_id, "results": results}
+
+
 def _parse_assignment(value: str, label: str) -> tuple[str, str]:
     if "=" not in value:
         raise CliError(f"{label} must use ID=VALUE syntax")
@@ -466,8 +589,9 @@ def _module_command(root: Path, *parts: str) -> list[str]:
 
 def _room_commands(
     state: ReviewState, job_id: str
-) -> tuple[list[str], list[list[str]], list[str]]:
+) -> tuple[list[str], list[list[str]], list[str], list[str]]:
     owner = _module_command(state.root, "owner", "--job", job_id)
+    broker = _module_command(state.root, "broker", "--job", job_id)
     reviewers = state.list_reviewers(job_id)
     observers = [
         _module_command(
@@ -481,7 +605,7 @@ def _room_commands(
         for reviewer in reviewers
     ]
     titles = [f"reviewer {reviewer.reviewer_id}" for reviewer in reviewers]
-    return owner, observers, titles
+    return owner, observers, titles, broker
 
 
 def _create_room(
@@ -491,10 +615,12 @@ def _create_room(
     attach: bool,
     replace: bool,
 ) -> dict[str, Any]:
-    owner, observers, titles = _room_commands(state, job_id)
+    prepare_mailbox(state.root, job_id)
+    owner, observers, titles, broker = _room_commands(state, job_id)
     return TmuxRoom(job_id).create(
         owner,
         observers,
+        broker_argv=broker,
         observer_titles=titles,
         attach=attach,
         replace=replace,
@@ -504,33 +630,35 @@ def _create_room(
 def _owner_prompt(state: ReviewState, job_id: str) -> str:
     reviewers = ", ".join(item.reviewer_id for item in state.list_reviewers(job_id))
     command = f"{shlex.quote(sys.executable)} -m mutual_review_room.cli --root {shlex.quote(str(state.root))}"
-    token_file = shlex.quote(str(state.root / job_id / "owner.token"))
     return (
         "You are the owner of a mutual-review terminal room. The human talks only to you in this "
         "left pane. The right panes are read-only projections; never ask the human to operate them. "
         f"The review job is {job_id}; selected reviewer IDs are: {reviewers}. "
         "For round 1, inspect the brief, write one complete task envelope with Goal, Scope, "
         "Constraints, Done when, and Current materials, then send the exact same file to every "
-        f"reviewer with: {command} dispatch-all --job {job_id} --round 1 --prompt-file PATH "
-        f"--token-file {token_file}. "
+        f"reviewer with: {command} dispatch-all --job {job_id} --round 1 --prompt-file PATH. "
         "For rounds 2 and 3, adjudicate each finding and send reviewer-specific follow-ups with "
-        f"{command} dispatch --job {job_id} --reviewer REVIEWER_ID --round N --prompt-file PATH "
-        f"--token-file {token_file}. "
+        f"{command} dispatch --job {job_id} --reviewer REVIEWER_ID --round N --prompt-file PATH. "
         "Never share one reviewer's full answer with another; quote only the finding needed for "
         "a directed challenge. Stop after round 3 and report unresolved disagreement explicitly. "
         "After reporting either convergence or unresolved disagreement, write the complete final "
         "synthesis (including unresolved disagreements) to a verdict file and persist it with: "
-        f"{command} complete --job {job_id} --verdict-file PATH --token-file {token_file}. "
+        f"{command} complete --job {job_id} --verdict-file PATH. "
         "Do not reveal or copy the owner token."
     )
 
 
 def _owner_environment(state: ReviewState, job_id: str) -> dict[str, str]:
     environment = os.environ.copy()
+    environment.pop("MRR_OWNER_TOKEN_FILE", None)
+    token = (state.root / job_id / "owner.token").read_text(encoding="utf-8").strip()
+    if not state.verify_owner_token(job_id, token):
+        raise CliError("owner control token is invalid")
     environment.update(
         {
             "MRR_JOB_ID": job_id,
-            "MRR_OWNER_TOKEN_FILE": str(state.root / job_id / "owner.token"),
+            "MRR_OWNER_TOKEN": token,
+            "MRR_REVIEWER_COUNT": str(len(state.list_reviewers(job_id))),
             "MRR_ROOT": str(state.root),
         }
     )
@@ -551,34 +679,20 @@ def _raise_nofile_for_owner() -> None:
         resource.setrlimit(resource.RLIMIT_NOFILE, (target_limit, hard_limit))
 
 
-def _codex_remote_uri(environment: dict[str, str]) -> str | None:
-    """Return the local shared app-server URI when Codex has created one."""
-
-    configured_home = environment.get("CODEX_HOME")
-    codex_home = (
-        Path(configured_home).expanduser()
-        if configured_home
-        else Path.home() / ".codex"
-    )
-    control_socket = codex_home / "app-server-control" / "app-server-control.sock"
-    if not control_socket.is_socket():
-        return None
-    return f"unix://{control_socket}"
-
-
 def _codex_owner_argv(
     executable: str,
     owner_cwd: str,
     session_id: str,
     model: str | None,
     *,
-    remote_uri: str | None = None,
+    mailbox_inbox: str | None = None,
 ) -> list[str]:
     """Build the interactive owner command with bounded, automatic approvals."""
 
-    argv = [executable]
-    if remote_uri:
-        argv.extend(["--remote", remote_uri])
+    project_trust = (
+        f"projects.{json.dumps(owner_cwd, ensure_ascii=False)}.trust_level=\"trusted\""
+    )
+    argv = [executable, "--config", project_trust]
     argv.extend(
         [
             "resume",
@@ -589,6 +703,8 @@ def _codex_owner_argv(
             "--no-alt-screen",
         ]
     )
+    if mailbox_inbox:
+        argv.extend(["--add-dir", mailbox_inbox])
     if model:
         argv.extend(["--model", model])
     argv.append(session_id)
@@ -604,6 +720,7 @@ def _exec_owner(state: ReviewState, job_id: str) -> None:
     prompt = _owner_prompt(state, job_id)
     environment = _owner_environment(state, job_id)
     model = _model(job.owner_model)
+    _raise_nofile_for_owner()
 
     if job.owner_provider == "claude":
         session_id = job.owner_session_id
@@ -633,7 +750,6 @@ def _exec_owner(state: ReviewState, job_id: str) -> None:
         if model:
             argv.extend(["--model", model])
         os.chdir(job.owner_cwd)
-        _raise_nofile_for_owner()
         os.execvpe(executable, argv, environment)
 
     if job.owner_provider == "codex":
@@ -645,6 +761,8 @@ def _exec_owner(state: ReviewState, job_id: str) -> None:
                 cwd=job.owner_cwd,
                 model=model,
                 timeout=300,
+                isolated_reviewer=False,
+                writable_dirs=[mailbox_paths(state.root, job_id).inbox],
             )
             session_id = result.session_id
             state.set_owner_session(job_id, session_id)
@@ -653,10 +771,9 @@ def _exec_owner(state: ReviewState, job_id: str) -> None:
             job.owner_cwd,
             session_id,
             model,
-            remote_uri=_codex_remote_uri(environment),
+            mailbox_inbox=str(mailbox_paths(state.root, job_id).inbox),
         )
         os.chdir(job.owner_cwd)
-        _raise_nofile_for_owner()
         os.execvpe(executable, argv, environment)
 
     if job.owner_provider == "kimi":
@@ -686,10 +803,197 @@ def _exec_owner(state: ReviewState, job_id: str) -> None:
             str(skills_dir),
         ]
         os.chdir(job.owner_cwd)
-        _raise_nofile_for_owner()
         os.execvpe(executable, argv, environment)
 
     raise CliError(f"owner provider has no interactive adapter: {job.owner_provider}")
+
+
+def _broker_payload(
+    payload: Any,
+    *,
+    required: set[str],
+    optional: set[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValidationError("broker payload must be an object")
+    optional = optional or set()
+    missing = required.difference(payload)
+    unknown = set(payload).difference(required | optional)
+    if missing or unknown:
+        raise ValidationError("broker payload fields do not match the action")
+    return payload
+
+
+def _broker_text(value: Any, field: str, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or "\x00" in value or len(value) > 1_000_000:
+        raise ValidationError(f"{field} is invalid")
+    if not allow_empty and not value.strip():
+        raise ValidationError(f"{field} must not be empty")
+    return value
+
+
+def _broker_round(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= 3:
+        raise ValidationError("round must be an integer from 1 through 3")
+    return value
+
+
+def _broker_timeout(value: Any) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not 0 < float(value) <= 3600
+    ):
+        raise ValidationError("timeout must be between 0 and 3600 seconds")
+    return float(value)
+
+
+def _optional_broker_id(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return _broker_text(value, field)
+
+
+def _run_broker_action(
+    state: ReviewState,
+    job_id: str,
+    action: str,
+    payload: Mapping[str, Any],
+    _control_request_id: str,
+) -> Mapping[str, Any]:
+    """Validate one signed command and execute it in the native broker."""
+
+    try:
+        if action == "dispatch":
+            values = _broker_payload(
+                dict(payload),
+                required={"reviewer_id", "round", "prompt", "timeout"},
+                optional={"parent_request_id", "request_id"},
+            )
+            reviewer_id = _broker_text(values["reviewer_id"], "reviewer_id")
+            round_no = _broker_round(values["round"])
+            result = dispatch_one(
+                state,
+                job_id,
+                reviewer_id,
+                round_no=round_no,
+                prompt=_broker_text(values["prompt"], "prompt"),
+                parent_request_id=_optional_broker_id(
+                    values.get("parent_request_id"), "parent_request_id"
+                ),
+                request_id=(
+                    _optional_broker_id(values.get("request_id"), "request_id")
+                    or _round_request_id(job_id, reviewer_id, round_no)
+                ),
+                timeout=_broker_timeout(values["timeout"]),
+            )
+            return {
+                "exit_code": 0 if result["status"] == "completed" else 3,
+                "output": result,
+            }
+
+        if action == "dispatch_all":
+            values = _broker_payload(
+                dict(payload),
+                required={"round", "prompt", "timeout"},
+            )
+            result = _dispatch_all_local(
+                state,
+                job_id,
+                round_no=_broker_round(values["round"]),
+                prompt=_broker_text(values["prompt"], "prompt"),
+                timeout=_broker_timeout(values["timeout"]),
+            )
+            return {
+                "exit_code": (
+                    0
+                    if any(item["status"] == "completed" for item in result["results"])
+                    else 3
+                ),
+                "output": result,
+            }
+
+        if action == "complete":
+            values = _broker_payload(dict(payload), required={"verdict"})
+            job = state.complete_job(
+                job_id,
+                _broker_text(values["verdict"], "verdict"),
+            )
+            completion = state.list_events(job_id, event_type="job_completed")[-1]
+            return {
+                "exit_code": 0,
+                "output": {
+                    "job": _jsonable(job),
+                    "completion_event": _jsonable(completion),
+                },
+            }
+
+        if action == "recover":
+            _broker_payload(dict(payload), required=set())
+            recovered = state.recover_job(job_id)
+            return {
+                "exit_code": 0,
+                "output": {
+                    "job_id": job_id,
+                    "interrupted": _jsonable(recovered),
+                    "replayed": False,
+                },
+            }
+
+        raise ValidationError(f"unsupported broker action: {action}")
+    except (CliError, ReviewStateError, OSError, ValueError) as error:
+        return {"exit_code": 2, "error": str(error)}
+
+
+def _broker_wait_timeout(provider_timeout: float, *, fan_out: bool) -> float:
+    if not fan_out:
+        return provider_timeout + 30.0
+    raw_count = os.environ.get("MRR_REVIEWER_COUNT", "16")
+    try:
+        reviewer_count = int(raw_count)
+    except ValueError:
+        reviewer_count = 16
+    reviewer_count = min(max(reviewer_count, 1), 10_000)
+    return min(provider_timeout * reviewer_count + 30.0, 86_400.0)
+
+
+def _submit_control(
+    args: argparse.Namespace,
+    *,
+    action: str,
+    payload: Mapping[str, Any],
+    wait_timeout: float,
+) -> tuple[int, Mapping[str, Any] | None, str | None]:
+    root = _root(args)
+    job_id = _job_id(args)
+    token = _client_token(root, job_id, getattr(args, "token_file", None))
+    paths = mailbox_paths(root, job_id)
+    control_id = submit_broker_request(paths, token, action, payload)
+    response: BrokerResponse = wait_for_broker(
+        paths,
+        token,
+        control_id,
+        timeout=wait_timeout,
+        stale_after=5.0,
+        startup_grace=3.0,
+    )
+    if response.status != "ok" or response.result is None:
+        message = (
+            response.error.get("message", "broker request failed")
+            if response.error
+            else "broker request failed"
+        )
+        return 2, None, message
+    exit_code = response.result.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        raise CliError("broker returned an invalid exit code")
+    output = response.result.get("output")
+    error = response.result.get("error")
+    if output is not None and not isinstance(output, Mapping):
+        raise CliError("broker returned an invalid output")
+    if error is not None and not isinstance(error, str):
+        raise CliError("broker returned an invalid error")
+    return exit_code, output, error
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -732,6 +1036,10 @@ def build_parser() -> argparse.ArgumentParser:
     owner = commands.add_parser("owner", help=argparse.SUPPRESS)
     owner.add_argument("--job")
     owner.set_defaults(handler=_cmd_owner)
+
+    broker = commands.add_parser("broker", help=argparse.SUPPRESS)
+    broker.add_argument("--job")
+    broker.set_defaults(handler=_cmd_broker)
 
     observe = commands.add_parser("observe", help="render one reviewer lane read-only")
     observe.add_argument("--job")
@@ -818,6 +1126,30 @@ def _cmd_owner(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_broker(args: argparse.Namespace) -> int:
+    state = ReviewState(_root(args))
+    job_id = _job_id(args)
+    state.get_job(job_id)
+    token_path = state.root / job_id / "owner.token"
+    if token_path.is_symlink() or not token_path.is_file():
+        raise CliError("owner control token file is unavailable")
+    token = token_path.read_text(encoding="utf-8").strip()
+    if not state.verify_owner_token(job_id, token):
+        raise CliError("owner control token is invalid")
+    serve_forever(
+        prepare_mailbox(state.root, job_id),
+        token,
+        lambda action, payload, request_id: _run_broker_action(
+            state,
+            job_id,
+            action,
+            payload,
+            request_id,
+        ),
+    )
+    return 0
+
+
 def _cmd_observe(args: argparse.Namespace) -> int:
     observe_reviewer(
         _root(args),
@@ -830,91 +1162,56 @@ def _cmd_observe(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
-    state = ReviewState(_root(args))
-    job_id = _job_id(args)
-    _authorize(state, job_id, args.token_file)
-    result = dispatch_one(
-        state,
-        job_id,
-        args.reviewer,
-        round_no=args.round_no,
-        prompt=_read_prompt(args),
-        parent_request_id=args.parent,
-        request_id=args.request_id,
-        timeout=args.timeout,
+    exit_code, output, error = _submit_control(
+        args,
+        action="dispatch",
+        payload={
+            "reviewer_id": args.reviewer,
+            "round": args.round_no,
+            "prompt": _read_prompt(args),
+            "parent_request_id": args.parent,
+            "request_id": args.request_id,
+            "timeout": args.timeout,
+        },
+        wait_timeout=_broker_wait_timeout(args.timeout, fan_out=False),
     )
-    _print_json(result)
-    return 0 if result["status"] == "completed" else 3
+    if output is not None:
+        _print_json(output)
+    if error:
+        print(f"mutual-review-room: {error}", file=sys.stderr)
+    return exit_code
 
 
 def _cmd_dispatch_all(args: argparse.Namespace) -> int:
-    state = ReviewState(_root(args))
-    job_id = _job_id(args)
-    _authorize(state, job_id, args.token_file)
-    prompt = _read_prompt(args)
-    job = state.get_job(job_id)
-    if job.status in {"complete", "failed"}:
-        raise StateConflictError(f"job is already {job.status}")
-    if not 1 <= args.round_no <= min(job.max_rounds, 3):
-        raise ValidationError(
-            f"round {args.round_no} exceeds job maximum {job.max_rounds}"
-        )
-    reviewers = state.list_reviewers(job_id)
-    queued = [
-        reviewer
-        for reviewer in reviewers
-        if reviewer.status not in {"unavailable", "running"}
-        and reviewer.current_round + 1 == args.round_no
-    ]
-    for position, reviewer in enumerate(queued, start=1):
-        state.append_event(
-            job_id,
-            reviewer_id=reviewer.reviewer_id,
-            session_id=reviewer.native_session_id,
-            round=args.round_no,
-            direction="system",
-            event_type="request_queued",
-            status="queued",
-            content=(
-                f"Queued for serial dispatch ({position}/{len(queued)}); "
-                "the provider has not started."
-            ),
-        )
-    results = []
-    for reviewer in reviewers:
-        try:
-            results.append(
-                dispatch_one(
-                    state,
-                    job_id,
-                    reviewer.reviewer_id,
-                    round_no=args.round_no,
-                    prompt=prompt,
-                    timeout=args.timeout,
-                )
-            )
-        except ReviewStateError as error:
-            results.append(
-                {
-                    "job_id": job_id,
-                    "reviewer_id": reviewer.reviewer_id,
-                    "round": args.round_no,
-                    "status": "failed",
-                    "reason": str(error),
-                }
-            )
-    _print_json({"job_id": job_id, "results": results})
-    return 0 if any(item["status"] == "completed" for item in results) else 3
+    exit_code, output, error = _submit_control(
+        args,
+        action="dispatch_all",
+        payload={
+            "round": args.round_no,
+            "prompt": _read_prompt(args),
+            "timeout": args.timeout,
+        },
+        wait_timeout=_broker_wait_timeout(args.timeout, fan_out=True),
+    )
+    if output is not None:
+        _print_json(output)
+    if error:
+        print(f"mutual-review-room: {error}", file=sys.stderr)
+    return exit_code
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
-    state = ReviewState(_root(args))
-    job_id = _job_id(args)
-    _authorize(state, job_id, args.token_file)
-    job = state.complete_job(job_id, _read_verdict(args))
-    completion_events = state.list_events(job_id, event_type="job_completed")
-    _print_json({"job": job, "completion_event": completion_events[-1]})
-    return 0
+    exit_code, output, error = _submit_control(
+        args,
+        action="complete",
+        payload={"verdict": _read_verdict(args)},
+        wait_timeout=30.0,
+    )
+    if output is not None:
+        _print_json(output)
+    if error:
+        print(f"mutual-review-room: {error}", file=sys.stderr)
+    return exit_code
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -934,19 +1231,47 @@ def _cmd_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_recover(args: argparse.Namespace) -> int:
-    state = ReviewState(_root(args))
-    job_id = _job_id(args)
-    _authorize(state, job_id, args.token_file)
-    recovered = state.recover_job(job_id)
-    _print_json({"job_id": job_id, "interrupted": recovered, "replayed": False})
-    return 0
+    """Recover through the live broker, falling back to a direct transition.
+
+    Recovery writes to the job database, which a sandboxed owner cannot do
+    itself.  When a broker is serving this job the request goes through it, so
+    the transition also stays serialized behind the job lock.  Without a live
+    broker there is no sandbox to respect and the owner recovers directly.
+    """
+
+    try:
+        exit_code, output, error = _submit_control(
+            args,
+            action="recover",
+            payload={},
+            wait_timeout=30.0,
+        )
+    except (BrokerUnavailable, MailboxSecurityError, CliError):
+        state = ReviewState(_root(args))
+        job_id = _job_id(args)
+        _authorize(state, job_id, args.token_file)
+        recovered = state.recover_job(job_id)
+        _print_json({"job_id": job_id, "interrupted": recovered, "replayed": False})
+        return 0
+    if output is not None:
+        _print_json(output)
+    if error:
+        print(f"mutual-review-room: {error}", file=sys.stderr)
+    return exit_code
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return int(args.handler(args))
-    except (CliError, ReviewStateError, TmuxRoomError, OSError, ValueError) as error:
+    except (
+        BrokerError,
+        CliError,
+        ReviewStateError,
+        TmuxRoomError,
+        OSError,
+        ValueError,
+    ) as error:
         print(f"mutual-review-room: {error}", file=sys.stderr)
         return 2
 

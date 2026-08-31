@@ -2,6 +2,7 @@ import sqlite3
 import stat
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from mutual_review_room.state import (
@@ -620,6 +621,39 @@ class ReviewStateTest(unittest.TestCase):
         self.state.set_owner_session("job_test", "owner-one")
         with self.assertRaises(StateConflictError):
             self.state.set_owner_session("job_test", "owner-two")
+
+    def test_reading_a_job_never_rewrites_correct_modes(self):
+        """A sandboxed owner may read the control root but not write to it."""
+
+        self.create_job()
+        job_dir = self.root / "job_test"
+        database = job_dir / "state.sqlite3"
+
+        def refuse(*args, **kwargs):
+            raise PermissionError(1, "Operation not permitted")
+
+        with unittest.mock.patch("mutual_review_room.state.os.chmod", refuse):
+            reopened = ReviewState(self.root)
+            self.assertEqual("ready", reopened.get_job("job_test").status)
+            self.assertEqual(2, len(reopened.list_reviewers("job_test")))
+            self.assertTrue(reopened.list_events("job_test"))
+
+        self.assertEqual(0o700, stat.S_IMODE(job_dir.stat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(database.stat().st_mode))
+
+    def test_a_wrong_mode_is_still_corrected_on_open(self):
+        self.create_job()
+        job_dir = self.root / "job_test"
+        database = job_dir / "state.sqlite3"
+        job_dir.chmod(0o755)
+        database.chmod(0o644)
+        self.root.chmod(0o755)
+
+        ReviewState(self.root).get_job("job_test")
+
+        self.assertEqual(0o700, stat.S_IMODE(self.root.stat().st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(job_dir.stat().st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(database.stat().st_mode))
 
 
 if __name__ == "__main__":

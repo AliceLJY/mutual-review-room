@@ -30,7 +30,6 @@ The Python runtime itself uses only the standard library. macOS Seatbelt is the
 current fail-closed filesystem boundary for reviewer processes.
 
 This is a version-sensitive alpha: provider CLIs change flags and event schemas.
-The release is tested on both development Macs with the following versions:
 
 | Component | Tested version |
 | --- | --- |
@@ -38,6 +37,21 @@ The release is tested on both development Macs with the following versions:
 | Codex CLI | 0.151.0 |
 | Kimi CLI | 0.39.1 |
 | tmux | 3.7b |
+
+Not every provider role has been exercised against a live account. What the
+0.1.0 acceptance run actually covered, on macOS 27 with those versions:
+
+| Role | State | Basis |
+| --- | --- | --- |
+| Kimi owner | verified | two-round room, native session resumed |
+| Codex owner | verified | room launched, dispatch issued from inside the owner sandbox |
+| Kimi reviewer | verified | two rounds, stable native session |
+| Codex reviewer | verified | two rounds, stable native session |
+| Claude owner | **unverified** | account was rate-limited (HTTP 429) during acceptance |
+| Claude reviewer | **unverified** | same |
+
+The Claude adapter is exercised by the automated tests but has not completed a
+live round here, so treat it as experimental until you have run it yourself.
 
 ## Install
 
@@ -71,6 +85,19 @@ Talk only in the left pane. The right panes are read-only. Point at any pane and
 use the mouse wheel to read its retained scrollback. Each pane keeps up to
 100,000 lines, rather than tmux's small default history.
 
+A Codex owner starts with automatic approval inside its normal
+`workspace-write` sandbox. The launcher marks only the exact owner working
+directory as trusted for that invocation and gives it the private broker inbox
+as one additional writable directory. It does not edit global Codex config or
+stop at the project-trust question. Binding the owner's native session makes
+one real provider call first, so the owner pane can take up to a minute to
+appear.
+
+Running from a clone rather than an install is supported: the owner is given a
+fully qualified `python3 -m mutual_review_room.cli --root ...` command, not a
+bare `mutual-review-room`, so it works whether or not the console script is on
+`PATH`.
+
 Repeat `--reviewer` for every reviewer you want. There is no fixed lane-count
 limit; terminal height is the practical limit. Built-in adapters currently
 cover Claude Code, Codex CLI, and Kimi CLI.
@@ -89,6 +116,23 @@ are rejected with a correction.
 
 Kimi currently uses its CLI-selected default model. `--owner-model` and
 `--reviewer-model` overrides for Kimi are rejected before a job is created.
+Kimi CLI 0.39.1 does have a `-m/--model` flag; the adapter does not pass it, so
+the room refuses the option instead of accepting a model it would ignore.
+
+## Reviewer tool isolation is measured, not assumed
+
+`mutual-review-room providers` reports what each adapter's isolation actually
+achieved, not what it requested. For Codex this matters: the room asks the CLI
+to disable nine execution and media surfaces, and on Codex CLI 0.151.0 eight of
+them apply while `features.unified_exec=false` is accepted and silently
+ignored. `--strict-config` does not catch it, because the key is recognised —
+just not honoured.
+
+So `tool_access` is reported as `sandboxed-residual` rather than `none`, naming
+the surface that stayed on, and the measurement is stored in the job's reviewer
+row. Codex reviewers remain bounded by the CLI read-only sandbox and the
+Seatbelt profile; that boundary is what is doing the work for that surface, and
+the room says so instead of claiming the tool is gone.
 
 ## What persists
 
@@ -102,6 +146,13 @@ Rebuilding a tmux room restores projections over the same ledger and resumes
 the stored native sessions. Every room uses a dedicated tmux server, so its
 mouse, history, and key settings do not change unrelated tmux sessions.
 
+A hidden job-local broker starts with the room. The sandboxed owner writes a
+signed request to a private file inbox; the broker invokes reviewers outside
+the owner's sandbox and applies each reviewer's own Seatbelt boundary. This
+avoids nested macOS sandboxes and does not require an approval prompt for every
+reviewer turn. The broker is not a network service, and reviewer processes
+cannot read its control directory.
+
 Useful recovery commands:
 
 ```bash
@@ -109,6 +160,10 @@ mutual-review-room status --job JOB_ID
 mutual-review-room room --job JOB_ID --replace
 mutual-review-room recover --job JOB_ID --token-file TOKEN_FILE
 ```
+
+`status` is a pure read and needs no token. `recover` needs owner authority:
+inside the owner pane the injected token is enough, so `--token-file` is only
+needed from another shell.
 
 `recover` records orphaned work as interrupted; it never resends that prompt or
 releases its round number. If round N is interrupted, continue at N+1. If round
@@ -123,9 +178,10 @@ releases its round number. If round N is interrupted, continue at N+1. If round
 - The owner must stop after round 3 and report unresolved disagreement honestly.
 - A failed or unavailable lane does not erase successful lanes.
 
-Dispatch uses the durable ledger, not tmux `send-keys`, pane scraping, or a
-shared chat. See [the architecture document](docs/architecture.md) for the
-identity, isolation, recovery, and exact-once boundaries.
+Dispatch uses the signed file inbox and durable ledger, not tmux `send-keys`,
+pane scraping, sockets, or a shared chat. See
+[the architecture document](docs/architecture.md) for the identity,
+isolation, recovery, and exact-once boundaries.
 
 ## Advanced tmux shortcuts
 
@@ -137,7 +193,12 @@ mode with `Ctrl-b [` and return to the live view with `q`.
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m compileall -q mutual_review_room
+python3 -m pip install '.[dev]'   # ruff is not a runtime dependency
 ruff check .
 ```
+
+The lint rule set is pinned in `pyproject.toml`. Ruff's default selection
+widened in 0.16, so leaving it unpinned made the same command pass on one ruff
+version and report dozens of style findings on another.
 
 MIT licensed.

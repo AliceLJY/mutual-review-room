@@ -590,11 +590,17 @@ class TmuxRoom:
         owner_argv: Sequence[str],
         observer_argvs: Sequence[Sequence[str]],
         *,
+        broker_argv: Optional[Sequence[str]] = None,
         observer_titles: Optional[Sequence[str]] = None,
         attach: bool = False,
         replace: bool = False,
     ) -> dict[str, Any]:
         owner = _validated_argv(owner_argv, "owner_argv")
+        broker = (
+            _validated_argv(broker_argv, "broker_argv")
+            if broker_argv is not None
+            else None
+        )
         observers = [
             _validated_argv(argv, f"observer_argvs[{index}]")
             for index, argv in enumerate(observer_argvs)
@@ -619,10 +625,10 @@ class TmuxRoom:
             self._run(["kill-session", "-t", f"={self.session_name}"])
 
         # Keep the session alive while its layout is being built.  A resumed
-        # owner can exit immediately (for example when an older CLI tries to
-        # open a session that is already loaded by the shared app server).  If
-        # the owner were the only initial pane, tmux would destroy the session
-        # before the observer panes and diagnostic surface existed.
+        # owner can exit immediately when its native session is unavailable or
+        # another startup check fails.  If the owner were the only initial
+        # pane, tmux would destroy the session before the observer panes and
+        # diagnostic surface existed.
         placeholder = [sys.executable, "-c", "import time; time.sleep(86400)"]
         created = self._run(
             [
@@ -740,6 +746,30 @@ class TmuxRoom:
             self._run(["select-layout", "-t", owner_pane, "main-vertical"])
             self._run(["resize-pane", "-t", owner_pane, "-x", "50%"])
             self._run(["select-pane", "-t", owner_pane])
+
+            # The broker must inherit the native launcher environment, not the
+            # Codex owner's Seatbelt sandbox.  Keep it in a hidden window and
+            # exchange only signed files; the owner cannot use the tmux socket
+            # as a command channel from inside its sandbox.
+            if broker is not None:
+                self._run(
+                    [
+                        "new-window",
+                        "-d",
+                        "-t",
+                        self.session_name,
+                        "-n",
+                        "broker",
+                        shlex.join(broker),
+                    ]
+                )
+                self._run(
+                    [
+                        "select-window",
+                        "-t",
+                        f"{self.session_name}:review-room",
+                    ]
+                )
             self._run(["respawn-pane", "-k", "-t", owner_pane, shlex.join(owner)])
             description = self.describe()
         except BaseException:
@@ -762,7 +792,13 @@ class TmuxRoom:
             return []
         fields = "#{pane_id}\t#{@mrr_title}\t#{pane_input_off}\t#{pane_active}\t#{pane_current_command}"
         result = self._run(
-            ["list-panes", "-t", f"={self.session_name}", "-F", fields]
+            [
+                "list-panes",
+                "-t",
+                f"{self.session_name}:review-room",
+                "-F",
+                fields,
+            ]
         )
         panes = []
         for line in str(getattr(result, "stdout", "")).splitlines():

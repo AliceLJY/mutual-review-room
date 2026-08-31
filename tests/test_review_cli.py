@@ -2,12 +2,21 @@ import io
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from mutual_review_room import cli as review_cli, runtime as review_runtime
+from mutual_review_room.broker import (
+    _validated_object as _validated_broker_object,
+    prepare_mailbox,
+    serve_forever,
+    serve_one,
+    submit,
+    wait,
+)
 from mutual_review_room.room import _ReviewStateView, render_reviewer
 from mutual_review_room.runtime import ProviderResult, ProviderUnavailable
 from mutual_review_room.state import ReviewState, ReviewerSpec, StateConflictError
@@ -125,23 +134,6 @@ class ReviewCliTests(unittest.TestCase):
         )
 
     def test_dispatch_all_queues_every_ready_lane_before_first_provider_starts(self):
-        prompt_file = Path(self.temp_dir.name) / "r1.md"
-        prompt_file.write_text("identical cold-read envelope", encoding="utf-8")
-        args = review_cli.build_parser().parse_args(
-            [
-                "--root",
-                str(self.root),
-                "dispatch-all",
-                "--job",
-                "job_cli",
-                "--round",
-                "1",
-                "--prompt-file",
-                str(prompt_file),
-                "--token-file",
-                self.created.token_path,
-            ]
-        )
         calls = []
         reviewer_order = [
             reviewer.reviewer_id for reviewer in self.state.list_reviewers("job_cli")
@@ -162,13 +154,16 @@ class ReviewCliTests(unittest.TestCase):
                 "status": "completed",
             }
 
-        with (
-            patch.object(review_cli, "dispatch_one", side_effect=fake_dispatch),
-            redirect_stdout(io.StringIO()),
-        ):
-            result = args.handler(args)
+        with patch.object(review_cli, "dispatch_one", side_effect=fake_dispatch):
+            result = review_cli._dispatch_all_local(
+                self.state,
+                "job_cli",
+                round_no=1,
+                prompt="identical cold-read envelope",
+                timeout=300.0,
+            )
 
-        self.assertEqual(0, result)
+        self.assertEqual("job_cli", result["job_id"])
         self.assertEqual(reviewer_order, calls)
         codex_queued = self.state.list_events(
             "job_cli", reviewer_id="codex-lane", event_type="request_queued"
@@ -184,28 +179,17 @@ class ReviewCliTests(unittest.TestCase):
         self.assertIn(f"({positions['claude-lane']}/2)", claude_queued.content)
 
     def test_dispatch_all_cannot_append_queue_events_after_completion(self):
-        prompt_file = Path(self.temp_dir.name) / "r1-after-complete.md"
-        prompt_file.write_text("must not queue", encoding="utf-8")
         self.state.complete_job("job_cli", "Final synthesis.")
         before = len(self.state.list_events("job_cli", limit=10_000))
-        args = review_cli.build_parser().parse_args(
-            [
-                "--root",
-                str(self.root),
-                "dispatch-all",
-                "--job",
-                "job_cli",
-                "--round",
-                "1",
-                "--prompt-file",
-                str(prompt_file),
-                "--token-file",
-                self.created.token_path,
-            ]
-        )
 
         with self.assertRaisesRegex(StateConflictError, "job is already complete"):
-            args.handler(args)
+            review_cli._dispatch_all_local(
+                self.state,
+                "job_cli",
+                round_no=1,
+                prompt="must not queue",
+                timeout=300.0,
+            )
 
         self.assertEqual(before, len(self.state.list_events("job_cli", limit=10_000)))
         self.assertEqual(
@@ -469,11 +453,85 @@ class ReviewCliTests(unittest.TestCase):
         with self.assertRaises(review_cli.CliError):
             review_cli._authorize(self.state, "job_cli", str(wrong))
 
-    def test_owner_prompt_passes_the_job_bound_token_file_path_not_its_value(self):
+    def test_authority_accepts_the_token_the_owner_launcher_injects(self):
+        """The launcher removes MRR_OWNER_TOKEN_FILE and injects MRR_OWNER_TOKEN."""
+
+        injected = review_cli._owner_environment(self.state, "job_cli")
+        self.assertNotIn("MRR_OWNER_TOKEN_FILE", injected)
+        self.assertEqual(self.created.owner_token, injected["MRR_OWNER_TOKEN"])
+
+        with patch.dict(
+            review_cli.os.environ,
+            {"MRR_OWNER_TOKEN": injected["MRR_OWNER_TOKEN"]},
+            clear=True,
+        ):
+            review_cli._authorize(self.state, "job_cli", None)
+            with patch.dict(
+                review_cli.os.environ, {"MRR_OWNER_TOKEN": "not-the-token"}
+            ):
+                with self.assertRaises(review_cli.CliError):
+                    review_cli._authorize(self.state, "job_cli", None)
+
+    def test_recover_is_available_as_a_signed_broker_action(self):
+        request = self.state.begin_request(
+            "job_cli", "codex-lane", round=1, prompt="brief"
+        )
+        self.assertEqual(
+            "running", self.state.get_request("job_cli", request.request_id).status
+        )
+
+        result = review_cli._run_broker_action(
+            self.state, "job_cli", "recover", {}, "control_1"
+        )
+
+        self.assertEqual(0, result["exit_code"])
+        self.assertEqual(
+            [request.request_id],
+            [item["request_id"] for item in result["output"]["interrupted"]],
+        )
+        self.assertFalse(result["output"]["replayed"])
+        self.assertEqual(
+            "interrupted", self.state.get_request("job_cli", request.request_id).status
+        )
+        # The broker only accepts JSON-serialisable results.
+        _validated_broker_object(result["output"], "result")
+
+    def test_recover_rejects_an_unexpected_payload(self):
+        result = review_cli._run_broker_action(
+            self.state, "job_cli", "recover", {"round": 1}, "control_1"
+        )
+        self.assertEqual(2, result["exit_code"])
+
+    def test_fan_out_skips_ineligible_lanes_and_says_so(self):
+        self.state.mark_unavailable("job_cli", "claude-lane", "provider is missing")
+        dispatched = []
+
+        def fake_dispatch(state, job_id, reviewer_id, **kwargs):
+            dispatched.append(reviewer_id)
+            return {
+                "job_id": job_id,
+                "reviewer_id": reviewer_id,
+                "round": kwargs["round_no"],
+                "status": "completed",
+            }
+
+        with patch.object(review_cli, "dispatch_one", fake_dispatch):
+            result = review_cli._dispatch_all_local(
+                self.state, "job_cli", round_no=1, prompt="shared brief", timeout=5.0
+            )
+
+        self.assertEqual(["codex-lane"], dispatched)
+        by_lane = {item["reviewer_id"]: item for item in result["results"]}
+        self.assertEqual({"codex-lane", "claude-lane"}, set(by_lane))
+        self.assertEqual("completed", by_lane["codex-lane"]["status"])
+        self.assertEqual("skipped", by_lane["claude-lane"]["status"])
+        self.assertIn("unavailable", by_lane["claude-lane"]["reason"])
+
+    def test_owner_prompt_keeps_owner_authority_out_of_commands_and_text(self):
         prompt = review_cli._owner_prompt(self.state, "job_cli")
 
-        self.assertIn(f"--token-file {self.created.token_path}", prompt)
-        self.assertEqual(3, prompt.count("--token-file"))
+        self.assertNotIn("--token-file", prompt)
+        self.assertNotIn(self.created.token_path, prompt)
         self.assertIn("complete --job job_cli", prompt)
         self.assertNotIn(self.created.owner_token, prompt)
 
@@ -499,50 +557,44 @@ class ReviewCliTests(unittest.TestCase):
 
     def test_complete_rejects_an_invalid_owner_token_without_mutating_state(self):
         initial_status = self.state.get_job("job_cli").status
-        Path(self.created.token_path).write_text("invalid-token", encoding="utf-8")
-        args = review_cli.build_parser().parse_args(
-            [
-                "--root",
-                str(self.root),
-                "complete",
-                "--job",
-                "job_cli",
-                "--verdict-file",
-                str(self.verdict_file),
-                "--token-file",
-                self.created.token_path,
-            ]
+        paths = prepare_mailbox(self.root, "job_cli")
+        request_id = submit(
+            paths,
+            "invalid-token",
+            "complete",
+            {"verdict": "must not be committed"},
+        )
+        handled = []
+        serve_one(
+            paths,
+            self.created.owner_token,
+            lambda *items: handled.append(items) or {"unexpected": True},
+        )
+        response = wait(
+            paths,
+            self.created.owner_token,
+            request_id,
+            timeout=1.0,
         )
 
-        with self.assertRaises(review_cli.CliError):
-            args.handler(args)
-
+        self.assertEqual("error", response.status)
+        self.assertEqual([], handled)
         self.assertEqual(self.state.get_job("job_cli").status, initial_status)
         self.assertEqual(
             self.state.list_events("job_cli", event_type="job_completed"), []
         )
 
     def test_complete_records_append_only_event_and_outputs_committed_state(self):
-        args = review_cli.build_parser().parse_args(
-            [
-                "--root",
-                str(self.root),
-                "complete",
-                "--job",
-                "job_cli",
-                "--verdict-file",
-                str(self.verdict_file),
-                "--token-file",
-                self.created.token_path,
-            ]
+        result = review_cli._run_broker_action(
+            self.state,
+            "job_cli",
+            "complete",
+            {"verdict": self.verdict_file.read_text(encoding="utf-8")},
+            "control_complete",
         )
-        output = io.StringIO()
 
-        with redirect_stdout(output):
-            result = args.handler(args)
-
-        payload = json.loads(output.getvalue())
-        self.assertEqual(result, 0)
+        payload = result["output"]
+        self.assertEqual(result["exit_code"], 0)
         self.assertEqual(payload["job"]["status"], "complete")
         self.assertEqual(payload["completion_event"]["event_type"], "job_completed")
         self.assertEqual(payload["completion_event"]["status"], "complete")
@@ -553,6 +605,59 @@ class ReviewCliTests(unittest.TestCase):
         events = self.state.list_events("job_cli", event_type="job_completed")
         self.assertEqual(len(events), 1)
         self.assertEqual(payload["completion_event"]["event_id"], events[0].event_id)
+
+    def test_sandbox_client_round_trips_through_the_native_broker(self):
+        paths = prepare_mailbox(self.root, "job_cli")
+        stopped = threading.Event()
+        broker = threading.Thread(
+            target=serve_forever,
+            args=(
+                paths,
+                self.created.owner_token,
+                lambda action, payload, request_id: review_cli._run_broker_action(
+                    self.state,
+                    "job_cli",
+                    action,
+                    payload,
+                    request_id,
+                ),
+            ),
+            kwargs={
+                "poll_interval": 0.01,
+                "heartbeat_interval": 0.01,
+                "stop_event": stopped,
+            },
+        )
+        broker.start()
+        args = review_cli.build_parser().parse_args(
+            [
+                "--root",
+                str(self.root),
+                "complete",
+                "--job",
+                "job_cli",
+                "--verdict-file",
+                str(self.verdict_file),
+            ]
+        )
+        output = io.StringIO()
+        try:
+            with (
+                patch.dict(
+                    review_cli.os.environ,
+                    {"MRR_OWNER_TOKEN": self.created.owner_token},
+                    clear=False,
+                ),
+                redirect_stdout(output),
+            ):
+                result = args.handler(args)
+        finally:
+            stopped.set()
+            broker.join(timeout=2.0)
+
+        self.assertFalse(broker.is_alive())
+        self.assertEqual(0, result)
+        self.assertEqual("complete", json.loads(output.getvalue())["job"]["status"])
 
     def test_status_reports_job_complete_after_owner_completion(self):
         self.state.complete_job("job_cli", "Final synthesis.")
@@ -593,37 +698,34 @@ class ReviewCliTests(unittest.TestCase):
         setrlimit.assert_called_once_with(review_cli.resource.RLIMIT_NOFILE, (2048, 2048))
 
     def test_codex_owner_keeps_sandbox_and_uses_auto_review_without_alt_screen(self):
+        inbox = str(Path(self.temp_dir.name) / "broker" / "inbox")
         argv = review_cli._codex_owner_argv(
             "/opt/homebrew/bin/codex",
             str(self.workspace),
             "native-owner-session",
             "gpt-5",
+            mailbox_inbox=inbox,
         )
 
         self.assertIn("--approve-for-me", argv)
         self.assertIn("--no-alt-screen", argv)
+        self.assertEqual(
+            f'projects."{self.workspace}".trust_level="trusted"',
+            argv[argv.index("--config") + 1],
+        )
         self.assertNotIn("-s", argv)
         self.assertNotIn("-a", argv)
         self.assertNotIn("danger-full-access", argv)
         self.assertNotIn("--yolo", argv)
+        self.assertEqual(inbox, argv[argv.index("--add-dir") + 1])
         self.assertEqual("native-owner-session", argv[-1])
 
-    def test_codex_owner_reconnects_through_the_shared_app_server(self):
-        remote_uri = "unix:///tmp/codex/app-server-control.sock"
-        argv = review_cli._codex_owner_argv(
-            "/opt/homebrew/bin/codex",
-            str(self.workspace),
-            "native-owner-session",
-            None,
-            remote_uri=remote_uri,
-        )
+    def test_owner_environment_uses_an_ephemeral_token_not_a_file_command(self):
+        environment = review_cli._owner_environment(self.state, "job_cli")
 
-        self.assertEqual(
-            ["/opt/homebrew/bin/codex", "--remote", remote_uri, "resume"],
-            argv[:4],
-        )
-        self.assertIn("--approve-for-me", argv)
-        self.assertIn("--no-alt-screen", argv)
+        self.assertEqual(self.created.owner_token, environment["MRR_OWNER_TOKEN"])
+        self.assertEqual("2", environment["MRR_REVIEWER_COUNT"])
+        self.assertNotIn("MRR_OWNER_TOKEN_FILE", environment)
 
     def test_claude_owner_binds_only_after_successful_bootstrap(self):
         result = ProviderResult(
@@ -670,15 +772,6 @@ class ReviewCliTests(unittest.TestCase):
                 review_cli._exec_owner(self.state, "job_cli")
 
         self.assertIsNone(self.state.get_job("job_cli").owner_session_id)
-
-    def test_codex_remote_uri_uses_the_configured_codex_home_socket(self):
-        codex_home = Path(self.temp_dir.name) / "custom-codex-home"
-        expected = codex_home / "app-server-control" / "app-server-control.sock"
-
-        with patch.object(Path, "is_socket", return_value=True):
-            remote_uri = review_cli._codex_remote_uri({"CODEX_HOME": str(codex_home)})
-
-        self.assertEqual(f"unix://{expected}", remote_uri)
 
     def test_projection_reads_real_state_and_hides_other_lane(self):
         self.state.set_reviewer_session("job_cli", "codex-lane", "codex-native")
@@ -959,10 +1052,12 @@ class ReviewCliTests(unittest.TestCase):
         ):
             state, created = review_cli._create_job(args)
 
-        _owner, _observers, titles = review_cli._room_commands(
+        _owner, _observers, titles, broker = review_cli._room_commands(
             state, created.job.job_id
         )
         self.assertEqual(["reviewer kimi", "reviewer codex"], titles)
+        self.assertEqual("broker", broker[-3])
+        self.assertEqual(created.job.job_id, broker[-1])
 
 
 if __name__ == "__main__":

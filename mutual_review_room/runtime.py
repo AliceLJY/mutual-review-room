@@ -57,6 +57,21 @@ _CHILD_ENV_ALLOWLIST = frozenset(
     }
 )
 _SESSION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}\Z")
+# Every execution/delegation/media surface an isolated Codex reviewer asks the
+# CLI to turn off.  It is also the exact list that is read back, so a request
+# can never silently drift away from what is verified.
+_CODEX_DISABLED_FEATURES = (
+    "shell_tool",
+    "unified_exec",
+    "multi_agent",
+    "view_image",
+    "apps",
+    "browser_use",
+    "computer_use",
+    "image_generation",
+    "skill_search",
+)
+_CODEX_FEATURE_STATES = {"true": True, "false": False}
 _SEATBELT_PROFILE_HEADER = "(version 1)\n(allow default)"
 _PROVIDER_SAFETY_UNSUPPORTED = "provider reviewer safety controls are unsupported"
 _KIMI_REVIEWER_PROFILE = """---
@@ -137,6 +152,113 @@ def _probe_sandbox_exec(executable: str) -> bool:
     return completed.returncode == 0
 
 
+def codex_feature_readback() -> dict[str, Any]:
+    """Report which reviewer feature overrides the Codex CLI actually applies.
+
+    Requesting ``features.<name>=false`` is not proof that the surface is off:
+    Codex CLI 0.151.0 accepts ``features.unified_exec=false`` without an error
+    and still reports the feature as enabled.  Nothing in the invocation path
+    fails, so a text-matching failure classifier cannot notice it.  The same
+    overrides are therefore replayed through ``codex features list`` and the
+    effective state is read back.
+
+    ``still_enabled`` lists features the CLI reports as on despite the
+    override.  ``unreported`` lists requested features absent from the listing,
+    which is treated as unverified rather than as success.
+    """
+
+    executable = shutil.which("codex")
+    if executable is None:
+        return {"verified": False, "reason": "provider executable is unavailable"}
+    return _codex_feature_readback(executable)
+
+
+@lru_cache(maxsize=4)
+def _codex_feature_readback(executable: str) -> dict[str, Any]:
+    argv = [executable, "features"]
+    for name in _CODEX_DISABLED_FEATURES:
+        argv.extend(["-c", f"features.{name}=false"])
+    argv.append("list")
+    try:
+        completed = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+            env=_child_environment(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {"verified": False, "reason": "feature readback did not complete"}
+    if completed.returncode != 0:
+        return {"verified": False, "reason": "feature readback was rejected"}
+
+    observed: dict[str, bool] = {}
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        state = _CODEX_FEATURE_STATES.get(fields[-1])
+        if state is not None and fields[0] not in observed:
+            observed[fields[0]] = state
+    if not observed:
+        return {"verified": False, "reason": "feature readback was unreadable"}
+
+    still_enabled = tuple(
+        name
+        for name in _CODEX_DISABLED_FEATURES
+        if observed.get(name) is True
+    )
+    unreported = tuple(
+        name for name in _CODEX_DISABLED_FEATURES if name not in observed
+    )
+    return {
+        "verified": True,
+        "still_enabled": still_enabled,
+        "unreported": unreported,
+    }
+
+
+def _codex_tool_isolation() -> dict[str, Any]:
+    """Describe the Codex reviewer tool boundary as measured, not as requested."""
+
+    readback = codex_feature_readback()
+    summary: dict[str, Any] = {
+        "requested_disabled_features": list(_CODEX_DISABLED_FEATURES),
+        "feature_state_verified": bool(readback.get("verified")),
+    }
+    if not readback.get("verified"):
+        summary["tool_access"] = "unverified"
+        summary["tool_isolation"] = (
+            "read-only CLI sandbox plus Seatbelt path isolation; "
+            "the effective feature state could not be read back "
+            f"({readback.get('reason', 'unknown reason')})"
+        )
+        return summary
+
+    still_enabled = list(readback.get("still_enabled", ()))
+    unreported = list(readback.get("unreported", ()))
+    summary["features_still_enabled"] = still_enabled
+    summary["features_unreported"] = unreported
+    if not still_enabled and not unreported:
+        summary["tool_access"] = "none"
+        summary["tool_isolation"] = (
+            "every requested feature override is confirmed disabled, plus a "
+            "read-only CLI sandbox and Seatbelt path isolation"
+        )
+        return summary
+
+    summary["tool_access"] = "sandboxed-residual"
+    residual = ", ".join(still_enabled + unreported)
+    summary["tool_isolation"] = (
+        "the CLI does not apply every requested feature override "
+        f"({residual}); the remaining boundary is the read-only CLI sandbox "
+        "and Seatbelt path isolation"
+    )
+    return summary
+
+
 def provider_capabilities() -> dict[str, dict[str, Any]]:
     """Describe the intentionally small set of built-in provider adapters."""
 
@@ -161,8 +283,7 @@ def provider_capabilities() -> dict[str, dict[str, Any]]:
             "prompt_transport": "stdin",
             "model_override": True,
             "filesystem_isolation": isolation,
-            "tool_access": "none",
-            "tool_isolation": "strict config overrides plus read-only sandbox",
+            **_codex_tool_isolation(),
         },
         "kimi": {
             "builtin": True,
@@ -193,6 +314,7 @@ def invoke(
     timeout: float = 300.0,
     deny_paths: Sequence[str | os.PathLike[str]] = (),
     isolated_reviewer: bool = True,
+    writable_dirs: Sequence[str | os.PathLike[str]] = (),
 ) -> ProviderResult:
     """Invoke a built-in provider without exposing control data to the child.
 
@@ -226,6 +348,15 @@ def invoke(
         raise ProviderUnavailable("missing", "provider executable is unavailable")
 
     working_dir = os.fspath(Path(cwd).expanduser())
+    owner_writable_dirs = tuple(
+        os.fspath(Path(path).expanduser().resolve()) for path in writable_dirs
+    )
+    if owner_writable_dirs and (isolated_reviewer or normalized != "codex"):
+        raise ValueError("additional writable directories are only valid for a Codex owner")
+    for path in owner_writable_dirs:
+        candidate = Path(path)
+        if candidate.is_symlink() or not candidate.is_dir():
+            raise ValueError("additional writable directory is unavailable")
     with ExitStack() as resources:
         if normalized == "claude":
             expected_session_id = session_id or str(uuid.uuid4())
@@ -242,6 +373,8 @@ def invoke(
                 working_dir,
                 session_id=session_id,
                 model=model,
+                isolated_reviewer=isolated_reviewer,
+                writable_dirs=owner_writable_dirs,
             )
         else:
             expected_session_id = session_id
@@ -324,40 +457,40 @@ def _codex_command(
     *,
     session_id: str | None,
     model: str | None,
+    isolated_reviewer: bool = True,
+    writable_dirs: Sequence[str] = (),
 ) -> list[str]:
-    command = [
-        executable,
-        "exec",
-        "--json",
-        "--color",
-        "never",
-        "--sandbox",
-        "read-only",
-        "--strict-config",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--skip-git-repo-check",
-        "-c",
-        "features.shell_tool=false",
-        "-c",
-        "features.unified_exec=false",
-        "-c",
-        "features.multi_agent=false",
-        "-c",
-        "features.view_image=false",
-        "-c",
-        "features.apps=false",
-        "-c",
-        "features.browser_use=false",
-        "-c",
-        "features.computer_use=false",
-        "-c",
-        "features.image_generation=false",
-        "-c",
-        "features.skill_search=false",
-        "-c",
-        "shell_environment_policy.inherit=none",
-    ]
+    command = [executable, "exec", "--json", "--color", "never"]
+    if isolated_reviewer:
+        command.extend(
+            [
+                "--sandbox",
+                "read-only",
+                "--strict-config",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--skip-git-repo-check",
+            ]
+        )
+        for name in _CODEX_DISABLED_FEATURES:
+            command.extend(["-c", f"features.{name}=false"])
+        command.extend(["-c", "shell_environment_policy.inherit=none"])
+    else:
+        trusted_cwd = os.fspath(Path(cwd).resolve())
+        project_trust = (
+            f"projects.{json.dumps(trusted_cwd, ensure_ascii=False)}"
+            '.trust_level="trusted"'
+        )
+        command.extend(
+            [
+                "--approve-for-me",
+                "--skip-git-repo-check",
+                "-c",
+                project_trust,
+            ]
+        )
+        for path in writable_dirs:
+            command.extend(["--add-dir", path])
     if model is not None:
         command.extend(["--model", model])
 

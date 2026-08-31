@@ -16,19 +16,52 @@ the owner adjudicates each answer and chooses what finding, if any, to quote to
 another reviewer. Reviewers never receive the owner conversation or another
 reviewer's transcript implicitly.
 
-Dispatch requires the job's `owner.token` file. Only its hash is stored in the
-database. Reviewer subprocesses receive a small environment allowlist; review
+Each job has an owner token whose hash is stored in the database. The native
+launcher injects the token into the trusted owner process without putting it in
+the owner prompt or command arguments. Owner control commands authenticate
+signed mailbox envelopes; the broker verifies them against the private token
+file. Reviewer subprocesses receive a small environment allowlist, so review
 control variables, token/key variables, and unrelated parent values are not
 inherited. This is a trusted single-user boundary, not remote or multi-user
 authentication.
 
 ### 2. Persistent-session runtime
 
-`mutual_review_room.runtime` contains explicit adapters for Claude Code, Codex, and
-Kimi. An adapter returns both the visible final answer and its provider-native
-session ID. The first successful request binds that ID to one reviewer in one
-job. Later requests pass the stored ID to the provider's native resume command;
-an unexpected ID is rejected instead of silently rebinding the lane.
+Room creation starts a hidden job-local broker window before the interactive
+owner. This process inherits the native launcher environment rather than the
+Codex owner's Seatbelt sandbox. The owner writes a bounded, HMAC-signed JSON
+request to a private ordinary-file inbox and waits for a signed result. The
+broker atomically claims the file, commits through the existing ledger, and
+invokes the provider. It keeps a heartbeat while provider calls block. A
+claimed request left by a broker crash is reported as abandoned and is never
+automatically replayed. Ordinary files are intentional: the Codex sandbox
+rejects control connections to the outer tmux socket, and the design does not
+open a network or Unix-socket service.
+
+The owner's writable grant is one directory: the mailbox inbox. Everything the
+owner writes has to fit inside it, including the lock that orders enqueues, so
+that lock lives in the inbox rather than beside the broker's own lock and
+heartbeat. Placing it one level up would have forced the grant to widen to the
+whole mailbox, which would also hand the owner the broker's outbox and
+processing claims.
+
+Commands split by whether they write. `status` is a pure read and runs directly
+against the job database, so it neither needs the broker nor queues behind a
+long provider call; the control root's permissions are checked but only
+rewritten when they are actually wrong, because an unconditional metadata write
+fails inside the owner sandbox even when it would change nothing. `recover`
+transitions request state, so it goes through the broker when one is serving
+the job and falls back to a direct transition only when there is no broker —
+and therefore no sandbox — to respect. Owner authority is accepted from either
+the private token file or the token the native launcher injects, since the
+launcher removes the file variable from the owner environment.
+
+`mutual_review_room.runtime` contains explicit adapters for Claude Code, Codex,
+and Kimi. An adapter returns both the visible final answer and its
+provider-native session ID. The first successful request binds that ID to one
+reviewer in one job. Later requests pass the stored ID to the provider's native
+resume command; an unexpected ID is rejected instead of silently rebinding the
+lane.
 
 The adapter catalog and one room's selected reviewer set are independent. A
 launcher selects the exact lanes for that job. The room has no fixed reviewer
@@ -45,9 +78,10 @@ status, content, and timestamp. Database triggers reject event updates and
 deletes. Request and reviewer rows hold the current operational projection;
 events remain the audit history.
 
-The runtime uses one process lock per reviewer lane. Round 1 fan-out is
-deliberately serial in the MVP: unavailable or failed lanes are recorded and
-the command continues to later reviewers. The control process never resubmits
+The broker uses one process lock per job, so only one controller can claim
+that job's signed requests. Round 1 fan-out is deliberately serial in the MVP:
+unavailable or failed lanes are recorded and the broker continues to later
+reviewers. The control path never resubmits
 an interrupted request automatically because a provider may already have
 answered before the local commit. Before serial fan-out begins, every eligible
 lane receives a durable `request_queued` event with its queue position. At the
@@ -78,7 +112,8 @@ status, provider, model, and stable native session ID. Internal reasoning,
 tool traffic, raw protocol chunks, and other reviewers' lanes are excluded.
 
 Each room runs on a dedicated tmux socket/server, so server-level key settings
-do not leak into unrelated user sessions. tmux creates a roughly 50/50
+do not leak into unrelated user sessions. A hidden window owns the broker; it
+is not part of the visible layout or an owner command channel. tmux creates a roughly 50/50
 left-right layout. Reviewer lanes are stacked on
 the right according to reviewer count. Their borders use durable reviewer IDs,
 such as `reviewer kimi` and `reviewer codex`. Observer
@@ -116,9 +151,11 @@ request. Cross-lane parents and provider session drift fail closed.
 
 ## Restart and recovery semantics
 
-The database and provider-native IDs survive controller and observer restarts.
-Recreating the tmux room starts fresh projections over the same ledger and
-resumes the stored owner session. `mutual-review-room recover` changes orphaned
+The database, mailbox, and provider-native IDs survive owner and observer
+restarts. Closing the terminal normally detaches from the dedicated tmux
+server, so its broker and in-flight request continue. Recreating the tmux room
+starts fresh projections over the same ledger and resumes the stored owner
+session. `mutual-review-room recover` changes orphaned
 `running` requests to `interrupted` and records that transition. It reports
 `replayed: false` and never feeds a summary into a new session as a substitute
 for provider-native continuation. Recovery does not release the interrupted
@@ -140,11 +177,30 @@ automatic retry.
 ## Provider boundaries
 
 - **Codex reviewer:** provider-native start/resume, user configuration and
-  project rules ignored, strict per-invocation configuration that disables
+  project rules ignored, per-invocation configuration that *requests* disabling
   shell/unified execution, delegation, apps, browser/computer use, image
   generation/reading, and skill search, plus a CLI read-only sandbox and
-  Seatbelt control/owner/peer isolation. Unknown safety keys fail closed instead
-  of falling back to a tool-enabled run. Only visible agent messages are stored.
+  Seatbelt control/owner/peer isolation. Only visible agent messages are stored.
+
+  Requesting an override is not the same as obtaining it. `--strict-config`
+  only rejects keys the CLI does not recognise, so a key that is accepted and
+  then ignored produces no error and no exit code for the failure classifier to
+  catch. The adapter therefore replays the same overrides through
+  `codex features list` and reads the effective state back.
+  `provider_capabilities()` reports that measurement — `tool_access` is `none`
+  only when every requested override is confirmed applied,
+  `sandboxed-residual` when the CLI keeps one enabled, and `unverified` when
+  the state cannot be read at all. The result is stored in each reviewer's
+  capability row when the job is created, so a room records the boundary it
+  actually had rather than the one it asked for.
+
+  **Measured on Codex CLI 0.151.0:** eight of the nine requested overrides
+  apply; `features.unified_exec=false` is accepted and silently ignored, and
+  `codex features --disable unified_exec` does not disable it either. The
+  remaining boundary for that surface is the CLI read-only sandbox plus the
+  Seatbelt profile, not the absence of the tool. This is reported rather than
+  failed closed: failing closed would disable Codex reviewers entirely on the
+  tested CLI, and the sandbox boundary is still enforced.
 - **Kimi reviewer:** provider-native start/resume and assistant messages only.
   The current CLI transports prompts in argv and has no provider-native
   all-in-one read-only switch. The first turn binds a self-contained custom
@@ -154,24 +210,33 @@ automatic retry.
   runs with a fresh invocation-private empty skills directory and Seatbelt
   denial of global Kimi instructions/MCP configuration plus
   control/owner/peer paths. Kimi model overrides are rejected before job
-  creation because the tested CLI has no matching adapter flag.
+  creation. Kimi CLI 0.39.1 does have a `-m/--model` flag; the adapter
+  deliberately does not pass it, so a per-lane model could be neither applied
+  nor verified. The room rejects the request up front instead of accepting a
+  model it would silently ignore.
 - **Claude reviewer:** provider-native session flags, no allowed tools, visible
   final result parsing, and the same Seatbelt wrapper before invocation.
-- **Owner:** trusted native CLI session. The owner can write because it must
-  create prompt files and call the local control CLI. A Codex owner uses
-  `--approve-for-me`, which selects automatic review with the `workspace-write`
-  sandbox. The current CLI rejects combining it with explicit `-s` or `-a`
-  options, so the room does not duplicate them; it does not use
-  `danger-full-access`. If the local shared app-server control socket exists,
-  resume connects through it; this reattaches a loaded owner after tmux is
-  rebuilt instead of opening a competing writer. Provider-specific owner
-  limitations are documented in the README instead of being hidden behind a
-  generic availability label. The adapter contract is tested against Claude
-  Code 2.1.251, Codex CLI 0.151.0, Kimi CLI 0.39.1, and tmux 3.7b; drift in
-  provider flags or event schemas requires a new compatibility check.
+- **Owner:** trusted native CLI session. The owner creates prompt files and
+  writes only signed control requests; it does not invoke reviewer providers.
+  A Codex owner receives the broker inbox as an additional writable directory
+  and uses `--approve-for-me`, which selects automatic review with the
+  `workspace-write` sandbox. It also sets
+  `projects.<owner-cwd>.trust_level="trusted"` as a per-invocation config
+  override, so a newly created room does not stop at Codex's project-trust
+  screen or mutate the user's global config. The current CLI rejects combining
+  `--approve-for-me` with explicit `-s` or `-a` options, so the room does not
+  duplicate them; it does not use `danger-full-access`. tmux owns the live
+  interactive CLI process. Rebuilding a room invokes the provider's native
+  resume command with the stored session ID, restoring the same owner
+  conversation without depending on a shared app-server process.
+  Provider-specific owner limitations are documented in the README instead of
+  being hidden behind a generic availability label. The adapter contract is
+  tested against Claude Code 2.1.251, Codex CLI 0.151.0, Kimi CLI 0.39.1, and
+  tmux 3.7b; drift in provider flags or event schemas requires a new
+  compatibility check.
 
 ## Non-goals
 
-The MVP does not add a browser dashboard, Electron application, Redis service,
-long-running controller daemon, shared reviewer chat, hidden-chain-of-thought
-display, automatic semantic voting, or cross-job memory.
+The MVP does not add a browser dashboard, Electron application, Redis or
+network service, shared reviewer chat, hidden-chain-of-thought display,
+automatic semantic voting, or cross-job memory.

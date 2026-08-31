@@ -343,6 +343,41 @@ class ReviewRuntimeTests(unittest.TestCase):
         self.assertEqual(CODEX_SESSION, resumed.session_id)
         self.assertEqual("resume", resumed.command_kind)
 
+    def test_codex_owner_bootstrap_uses_final_trust_and_bounded_writable_root(self):
+        process = FakeProcess(stdout=codex_output(messages=("owner ready",)))
+        with tempfile.TemporaryDirectory(prefix="review-owner-") as directory:
+            root = Path(directory)
+            workspace = root / "Owner Project"
+            inbox = root / "broker" / "inbox"
+            workspace.mkdir()
+            inbox.mkdir(parents=True)
+            with (
+                patch.object(review_runtime.shutil, "which", return_value="/bin/codex"),
+                patch.object(
+                    review_runtime.subprocess, "Popen", return_value=process
+                ) as popen,
+            ):
+                result = review_runtime.invoke(
+                    "codex",
+                    "load owner contract",
+                    cwd=workspace,
+                    isolated_reviewer=False,
+                    writable_dirs=[inbox],
+                )
+
+        argv = popen.call_args.args[0]
+        self.assertIn("--approve-for-me", argv)
+        self.assertEqual(
+            f'projects."{workspace.resolve()}".trust_level="trusted"',
+            argv[argv.index("-c") + 1],
+        )
+        self.assertEqual(str(inbox.resolve()), argv[argv.index("--add-dir") + 1])
+        self.assertNotIn("--ignore-user-config", argv)
+        self.assertNotIn("features.shell_tool=false", argv)
+        self.assertNotIn("danger-full-access", argv)
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
+        self.assertEqual(CODEX_SESSION, result.session_id)
+
     def test_codex_rejects_thread_drift(self):
         process = FakeProcess(stdout=codex_output(session_id=CLAUDE_SESSION))
         with (
@@ -736,6 +771,150 @@ class ReviewRuntimeTests(unittest.TestCase):
         self.assertEqual("missing", missing.exception.category)
         self.assertEqual("missing", unknown.exception.category)
         popen.assert_not_called()
+
+
+def codex_features_listing(overrides):
+    """Render a `codex features list` table honouring only some overrides."""
+
+    lines = []
+    for name in review_runtime._CODEX_DISABLED_FEATURES:
+        state = overrides.get(name, False)
+        lines.append(f"{name:<40} stable             {str(state).lower()}")
+    return "\n".join(lines) + "\n"
+
+
+class CodexFeatureReadbackTests(unittest.TestCase):
+    """The requested feature state is not evidence; the read-back state is."""
+
+    def setUp(self):
+        review_runtime._codex_feature_readback.cache_clear()
+        self.addCleanup(review_runtime._codex_feature_readback.cache_clear)
+
+    def _readback(self, **run_kwargs):
+        with (
+            patch.object(
+                review_runtime.shutil,
+                "which",
+                side_effect=lambda name: "/bin/codex" if name == "codex" else None,
+            ),
+            patch.object(review_runtime.subprocess, "run", **run_kwargs) as run,
+        ):
+            return review_runtime.codex_feature_readback(), run
+
+    def test_every_disabled_feature_is_read_back_with_the_same_overrides(self):
+        listing = subprocess.CompletedProcess(
+            ["codex"], returncode=0, stdout=codex_features_listing({}), stderr=""
+        )
+        readback, run = self._readback(return_value=listing)
+
+        self.assertTrue(readback["verified"])
+        self.assertEqual((), readback["still_enabled"])
+        self.assertEqual((), readback["unreported"])
+        argv = run.call_args.args[0]
+        for name in review_runtime._CODEX_DISABLED_FEATURES:
+            self.assertIn(f"features.{name}=false", argv)
+        self.assertEqual("list", argv[-1])
+
+    def test_a_silently_ignored_override_is_reported_not_hidden(self):
+        listing = subprocess.CompletedProcess(
+            ["codex"],
+            returncode=0,
+            stdout=codex_features_listing({"unified_exec": True}),
+            stderr="",
+        )
+        readback, _ = self._readback(return_value=listing)
+
+        self.assertTrue(readback["verified"])
+        self.assertEqual(("unified_exec",), readback["still_enabled"])
+
+    def test_a_feature_absent_from_the_listing_counts_as_unverified(self):
+        rows = [
+            line
+            for line in codex_features_listing({}).splitlines()
+            if not line.startswith("skill_search")
+        ]
+        listing = subprocess.CompletedProcess(
+            ["codex"], returncode=0, stdout="\n".join(rows), stderr=""
+        )
+        readback, _ = self._readback(return_value=listing)
+
+        self.assertEqual(("skill_search",), readback["unreported"])
+
+    def test_an_unusable_readback_is_unverified_rather_than_clean(self):
+        for kwargs in (
+            {"return_value": subprocess.CompletedProcess(["codex"], returncode=2)},
+            {"return_value": subprocess.CompletedProcess(["codex"], 0, stdout="", stderr="")},
+            {"side_effect": OSError("boom")},
+            {"side_effect": subprocess.TimeoutExpired("codex", 15)},
+        ):
+            with self.subTest(kwargs=sorted(kwargs)):
+                review_runtime._codex_feature_readback.cache_clear()
+                readback, _ = self._readback(**kwargs)
+                self.assertFalse(readback["verified"])
+                self.assertIn("reason", readback)
+
+    def test_capabilities_report_the_measured_state_not_the_request(self):
+        cases = {
+            "none": codex_features_listing({}),
+            "sandboxed-residual": codex_features_listing({"unified_exec": True}),
+        }
+        for expected, stdout in cases.items():
+            with self.subTest(tool_access=expected):
+                review_runtime._codex_feature_readback.cache_clear()
+                listing = subprocess.CompletedProcess(
+                    ["codex"], returncode=0, stdout=stdout, stderr=""
+                )
+                with (
+                    patch.object(
+                        review_runtime.shutil, "which", return_value="/bin/codex"
+                    ),
+                    patch.object(review_runtime.subprocess, "run", return_value=listing),
+                    patch.object(
+                        review_runtime, "_probe_sandbox_exec", return_value=True
+                    ),
+                ):
+                    codex = review_runtime.provider_capabilities()["codex"]
+                self.assertEqual(expected, codex["tool_access"])
+                self.assertTrue(codex["feature_state_verified"])
+        self.assertIn("unified_exec", codex["features_still_enabled"])
+        self.assertIn("unified_exec", codex["tool_isolation"])
+
+    def test_capabilities_stay_role_neutral_in_every_readback_outcome(self):
+        listings = (
+            subprocess.CompletedProcess(
+                ["codex"], returncode=0, stdout=codex_features_listing({}), stderr=""
+            ),
+            subprocess.CompletedProcess(
+                ["codex"],
+                returncode=0,
+                stdout=codex_features_listing({"unified_exec": True}),
+                stderr="",
+            ),
+            subprocess.CompletedProcess(["codex"], returncode=2, stdout="", stderr=""),
+        )
+        for listing in listings:
+            with self.subTest(returncode=listing.returncode):
+                review_runtime._codex_feature_readback.cache_clear()
+                with (
+                    patch.object(
+                        review_runtime.shutil, "which", return_value="/bin/codex"
+                    ),
+                    patch.object(review_runtime.subprocess, "run", return_value=listing),
+                ):
+                    rendered = repr(review_runtime.provider_capabilities()).lower()
+                self.assertNotIn("owner", rendered)
+                self.assertNotIn("reviewer", rendered)
+
+    def test_the_command_disables_exactly_the_features_that_are_read_back(self):
+        command = review_runtime._codex_command(
+            "/bin/codex", "/work", session_id=None, model=None
+        )
+        requested = {
+            value.split("=", 1)[0].removeprefix("features.")
+            for value in command
+            if value.startswith("features.") and value.endswith("=false")
+        }
+        self.assertEqual(set(review_runtime._CODEX_DISABLED_FEATURES), requested)
 
 
 if __name__ == "__main__":
