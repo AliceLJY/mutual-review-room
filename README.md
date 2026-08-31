@@ -48,18 +48,27 @@ Not every provider role has been exercised against a live account. What the
 | Kimi reviewer | verified | two rounds, stable native session |
 | Codex reviewer | verified | two rounds, stable native session |
 | Claude owner | verified | full round 1: launch, contract load, dispatch issued, both reviewers answered |
-| Claude reviewer | **unverified** | no live round yet |
+| Claude reviewer | **tested, not usable** | plumbing works but zero findings: plan mode turns the reply into a process statement |
 
 The Claude adapter is exercised by the automated tests. During the 0.1.0
 acceptance run the account was rate-limited (HTTP 429), so neither Claude role
-was verified; on 2026-09-01 the Claude owner was retested on 0.1.1 through a
-full round 1: room launch, owner contract load and interactive takeover, a
-`dispatch-all` issued by the owner, and independent answers from both the codex
-and kimi reviewers returning to the owner — all succeeded, with no rate
-limiting. The one rough edge is that the contract-load turn is slow: two
+was verified; on 2026-09-01 both were retested on 0.1.1. The Claude owner
+completed a full round 1: room launch, owner contract load and interactive
+takeover, a `dispatch-all` issued by the owner, and independent answers from
+both the codex and kimi reviewers returning to the owner — all succeeded, with
+no rate limiting. The rough edge is that the contract-load turn is slow: two
 measured runs took 4m24s and 2m29s (Codex takes seconds for the same step), and
 the first logged one `model_refusal_fallback`. Final adjudication (`complete`)
-and the Claude reviewer have not run live yet, so verify those two yourself.
+is also verified: a codex owner wrote the verdict and closed the job cleanly.
+The Claude reviewer, however, surfaced a substantive problem: the plumbing —
+dispatch, answer, return, settlement — all works (the answer took ~75s), but
+the reply was a process statement ("I will write my conclusions into a plan
+file and request approval") with zero review findings. The hard-coded
+`--permission-mode plan` in `_claude_command` changes Claude's reply shape (on
+the owner side the same flag only affects the one-shot contract-load turn, and
+the interactive takeover has no such limit, which is why the owner works while
+the reviewer does not). Do not use Claude as a reviewer until that flag is
+changed and re-verified.
 
 ## Install
 
