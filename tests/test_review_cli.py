@@ -535,6 +535,19 @@ class ReviewCliTests(unittest.TestCase):
         self.assertIn("complete --job job_cli", prompt)
         self.assertNotIn(self.created.owner_token, prompt)
 
+    def test_owner_prompt_says_reviewers_cannot_read_the_paths_it_names(self):
+        """A path-only envelope leaves an isolated reviewer nothing to review.
+
+        Observed live: one lane refused to review and asked for the material to
+        be pasted, because the envelope referenced a file it had no tools to
+        open.
+        """
+
+        prompt = review_cli._owner_prompt(self.state, "job_cli")
+
+        self.assertIn("no file access", prompt)
+        self.assertIn("inline", prompt)
+
     def test_complete_parser_selects_owner_only_handler(self):
         args = review_cli.build_parser().parse_args(
             [
