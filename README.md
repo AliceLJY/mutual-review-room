@@ -47,11 +47,17 @@ Not every provider role has been exercised against a live account. What the
 | Codex owner | verified | room launched, dispatch issued from inside the owner sandbox |
 | Kimi reviewer | verified | two rounds, stable native session |
 | Codex reviewer | verified | two rounds, stable native session |
-| Claude owner | **unverified** | account was rate-limited (HTTP 429) during acceptance |
-| Claude reviewer | **unverified** | same |
+| Claude owner | partially verified | 0.1.1 retest: launch and contract load succeeded, dispatch unverified |
+| Claude reviewer | **unverified** | no live round yet |
 
-The Claude adapter is exercised by the automated tests but has not completed a
-live round here, so treat it as experimental until you have run it yourself.
+The Claude adapter is exercised by the automated tests. During the 0.1.0
+acceptance run the account was rate-limited (HTTP 429), so neither Claude role
+was verified; on 2026-08-31 the Claude owner was retested on 0.1.1: room
+launch, owner contract load and interactive takeover all succeeded with no rate
+limiting, but the contract-load turn took about 4m24s (Codex takes seconds for
+the same step) and logged one `model_refusal_fallback`. Issuing a dispatch from
+the owner is still unverified, and the Claude reviewer has not run a live round,
+so treat the Claude side as experimental until you have run it yourself.
 
 ## Install
 
