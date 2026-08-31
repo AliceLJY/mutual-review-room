@@ -817,6 +817,16 @@ class TmuxRoom:
             )
         return panes
 
+    def attach(self) -> None:
+        """Join a room that is already running, without rebuilding it."""
+
+        if not self.exists():
+            raise TmuxRoomError(f"review room does not exist: {self.session_name}")
+        self._run(
+            ["attach-session", "-t", f"={self.session_name}"],
+            interactive=True,
+        )
+
     def describe(self) -> dict[str, Any]:
         exists = self.exists()
         panes = self.list_panes() if exists else []

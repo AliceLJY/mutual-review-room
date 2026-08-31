@@ -535,6 +535,51 @@ class ReviewCliTests(unittest.TestCase):
         self.assertIn("complete --job job_cli", prompt)
         self.assertNotIn(self.created.owner_token, prompt)
 
+    def test_reopening_a_live_room_joins_it_instead_of_rebuilding(self):
+        """Getting back into a detached room must not restart the owner."""
+
+        args = review_cli.build_parser().parse_args(
+            ["--root", str(self.root), "room", "--job", "job_cli"]
+        )
+        with (
+            patch.object(review_cli.TmuxRoom, "exists", return_value=True),
+            patch.object(review_cli.TmuxRoom, "attach") as attach,
+            patch.object(review_cli, "_create_room") as create,
+        ):
+            self.assertEqual(0, args.handler(args))
+
+        attach.assert_called_once()
+        create.assert_not_called()
+
+    def test_replace_still_rebuilds_a_live_room(self):
+        args = review_cli.build_parser().parse_args(
+            ["--root", str(self.root), "room", "--job", "job_cli", "--replace"]
+        )
+        with (
+            patch.object(review_cli.TmuxRoom, "exists", return_value=True),
+            patch.object(review_cli.TmuxRoom, "attach") as attach,
+            patch.object(review_cli, "_create_room", return_value={}) as create,
+        ):
+            self.assertEqual(0, args.handler(args))
+
+        create.assert_called_once()
+        self.assertTrue(create.call_args.kwargs["replace"])
+        attach.assert_not_called()
+
+    def test_reopening_a_room_that_is_not_running_builds_it(self):
+        args = review_cli.build_parser().parse_args(
+            ["--root", str(self.root), "room", "--job", "job_cli"]
+        )
+        with (
+            patch.object(review_cli.TmuxRoom, "exists", return_value=False),
+            patch.object(review_cli.TmuxRoom, "attach") as attach,
+            patch.object(review_cli, "_create_room", return_value={}) as create,
+        ):
+            self.assertEqual(0, args.handler(args))
+
+        create.assert_called_once()
+        attach.assert_not_called()
+
     def test_owner_prompt_says_reviewers_cannot_read_the_paths_it_names(self):
         """A path-only envelope leaves an isolated reviewer nothing to review.
 

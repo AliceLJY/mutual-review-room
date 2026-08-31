@@ -1111,9 +1111,24 @@ def _cmd_launch(args: argparse.Namespace) -> int:
 
 
 def _cmd_room(args: argparse.Namespace) -> int:
+    """Open the job's room, building it only when one is not already running.
+
+    Getting back into a room you detached from is the most common thing to
+    want, so a live room is joined rather than refused. Rebuilding is still
+    available, but it restarts the owner process and drops the panes'
+    scrollback, so it stays behind an explicit ``--replace``.
+    """
+
     state = ReviewState(_root(args))
     job_id = _job_id(args)
     state.get_job(job_id)
+    room = TmuxRoom(job_id)
+    if room.exists() and not args.replace:
+        if args.no_attach:
+            _print_json(room.describe())
+            return 0
+        room.attach()
+        return 0
     description = _create_room(
         state,
         job_id,

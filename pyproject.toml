@@ -1,6 +1,6 @@
 [project]
 name = "mutual-review-room"
-version = "0.1.0"
+version = "0.1.1"
 description = "Owner-led terminal rooms for persistent multi-model review"
 readme = "README.md"
 license = "MIT"
