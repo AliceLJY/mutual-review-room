@@ -49,8 +49,8 @@ Not every provider role has been exercised against a live account. What the
 | Codex owner | verified | room launched, dispatch issued from inside the owner sandbox |
 | Kimi reviewer | verified | two rounds, stable native session |
 | Codex reviewer | verified | two rounds, stable native session |
-| Claude owner | verified | full round: contract loaded in 2s as instructed, dispatch issued, final `complete` (retested on 0.1.2) |
-| Claude reviewer | verified | two rounds, stable native session, round 2 correctly recalled round 1 (retested on 0.1.2) |
+| Claude owner | verified | full round: contract loaded in 2s as instructed, dispatch issued, final `complete` (retested on 0.2.0) |
+| Claude reviewer | verified | two rounds, stable native session, round 2 correctly recalled round 1 (retested on 0.2.0) |
 
 The Claude adapter is exercised by the automated tests. During the 0.1.0
 acceptance run the account was rate-limited (HTTP 429), so neither Claude role
@@ -62,7 +62,7 @@ read-only safety is already enforced by `--tools ""` plus Seatbelt, and under
 controlled replay confirmed it: removing only that flag, the same envelope
 produced two correct findings in 24 seconds; since the call carries
 `--safe-mode`, which disables all user-side customization, this is native CLI
-behavior, not an artifact of the test machine). 0.1.2 removes the flag, and a
+behavior, not an artifact of the test machine). 0.2.0 removes the flag, and a
 re-verification ran a Claude owner + Claude reviewer room through a full
 round: the contract load answered with the single required sentence in 2
 seconds (previously 2.5–4.5 minutes with one `model_refusal_fallback`), the
