@@ -440,8 +440,10 @@ def _claude_command(
             "json",
             "--safe-mode",
             "--strict-mcp-config",
-            "--permission-mode",
-            "plan",
+            # No --permission-mode plan here: read-only is already enforced by
+            # --tools "" plus the Seatbelt profile, while plan mode makes a
+            # --print reviewer answer with "I'll write a plan and request
+            # approval" instead of findings (verified 2026-09-01, see README).
             "--tools",
             "",
         ]

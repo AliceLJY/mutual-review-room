@@ -141,13 +141,12 @@ class ReviewRuntimeTests(unittest.TestCase):
                 "json",
                 "--safe-mode",
                 "--strict-mcp-config",
-                "--permission-mode",
-                "plan",
                 "--tools",
                 "",
             ],
             argv,
         )
+        self.assertNotIn("--permission-mode", argv)
         self.assertNotIn("cold-read prompt", argv)
         self.assertEqual(["cold-read prompt"], process.inputs)
         self.assertEqual([17], process.timeouts)

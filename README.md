@@ -47,38 +47,27 @@ Not every provider role has been exercised against a live account. What the
 | Codex owner | verified | room launched, dispatch issued from inside the owner sandbox |
 | Kimi reviewer | verified | two rounds, stable native session |
 | Codex reviewer | verified | two rounds, stable native session |
-| Claude owner | verified | full round 1: launch, contract load, dispatch issued, both reviewers answered |
-| Claude reviewer | **tested, not usable** | plumbing works but zero findings: plan mode turns the reply into a process statement |
+| Claude owner | verified | full round: contract loaded in 2s as instructed, dispatch issued, final `complete` (retested on 0.1.2) |
+| Claude reviewer | verified | one live round: two correct findings in 20s (retested on 0.1.2) |
 
 The Claude adapter is exercised by the automated tests. During the 0.1.0
 acceptance run the account was rate-limited (HTTP 429), so neither Claude role
-was verified; on 2026-09-01 both were retested on 0.1.1. The Claude owner
-completed a full round 1: room launch, owner contract load and interactive
-takeover, a `dispatch-all` issued by the owner, and independent answers from
-both the codex and kimi reviewers returning to the owner — all succeeded, with
-no rate limiting. The rough edge is that the contract-load turn is slow: two
-measured runs took 4m24s and 2m29s (Codex takes seconds for the same step), and
-the first logged one `model_refusal_fallback`. Final adjudication (`complete`)
-is also verified: a codex owner wrote the verdict and closed the job cleanly.
-The Claude reviewer, however, surfaced a substantive problem: the plumbing —
-dispatch, answer, return, settlement — all works (the answer took ~75s), but
-the reply was a process statement ("I will write my conclusions into a plan
-file and request approval") with zero review findings. The root cause was
-pinned with a controlled replay: the same task envelope, the same
-`--safe-mode --strict-mcp-config --tools ""`, with only `--permission-mode
-plan` removed — Claude then returned two correct findings (empty-sequence
-division by zero, generator without `__len__`) in 24 seconds. Since
-`--safe-mode` disables all user-side customization (CLAUDE.md, hooks, MCP
-servers, skills), this is native Claude CLI behavior, not an artifact of the
-test machine's local configuration. In other words Claude is a perfectly
-capable reviewer; the only obstacle is the hard-coded plan mode — the native
-plan reminder instructs it to write a plan file and request approval, and
-under `--print` nobody is there to approve. Read-only safety is already
-enforced by `--tools ""` plus Seatbelt, so plan mode adds nothing here. On the
-owner side the same flag only affects the one-shot contract-load turn (the
-interactive takeover has no such limit), which is why the owner works while
-the reviewer does not. Do not use Claude as a reviewer until that flag is
-removed and re-verified.
+was verified. A 0.1.1 retest found the reviewer replying with a process
+statement ("I will write a plan and request approval") and zero findings; the
+root cause was the hard-coded `--permission-mode plan` in `_claude_command` —
+read-only safety is already enforced by `--tools ""` plus Seatbelt, and under
+`--print` plan mode just makes Claude wait for an approval that never comes (a
+controlled replay confirmed it: removing only that flag, the same envelope
+produced two correct findings in 24 seconds; since the call carries
+`--safe-mode`, which disables all user-side customization, this is native CLI
+behavior, not an artifact of the test machine). 0.1.2 removes the flag, and a
+re-verification ran a Claude owner + Claude reviewer room through a full
+round: the contract load answered with the single required sentence in 2
+seconds (previously 2.5–4.5 minutes with one `model_refusal_fallback`), the
+owner issued `dispatch-all`, the reviewer returned two correct findings in 20
+seconds, and the owner wrote the verdict and closed the job with `complete`.
+An earlier Claude owner round with codex/kimi reviewers and a codex-owner
+adjudication were verified separately.
 
 ## Install
 
