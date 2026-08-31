@@ -56,12 +56,34 @@ live round here, so treat it as experimental until you have run it yourself.
 ## Install
 
 ```bash
-git clone https://github.com/AliceLJY/mutual-review-room.git
-cd mutual-review-room
-python3 -m pip install .
+uv tool install git+https://github.com/AliceLJY/mutual-review-room
 ```
 
-You can also run directly from a clone with `./scripts/mutual-review-room`.
+That puts `mutual-review-room` on your `PATH` in an isolated environment.
+`pipx install git+https://github.com/AliceLJY/mutual-review-room` does the same
+thing if you prefer pipx. To move to a newer version later, re-run the same
+command with `--force`.
+
+From a clone instead:
+
+```bash
+git clone https://github.com/AliceLJY/mutual-review-room.git
+cd mutual-review-room
+python3 -m pip install .          # inside a virtualenv
+./scripts/mutual-review-room      # or just run it in place, no install
+```
+
+A bare `pip install .` against a Homebrew or system Python is refused by
+[PEP 668](https://peps.python.org/pep-0668/); use a virtualenv, or one of the
+tool installers above, rather than `--break-system-packages`.
+
+**This is deliberately not on PyPI.** A one-command install already works
+straight from git, so publishing would buy a shorter name and nothing else,
+while a PyPI name is claimed permanently on first upload. That is a poor trade
+for something this young: macOS-only, alpha, and tied to the exact flags and
+event schemas of three provider CLIs that can change under it. Worth
+reconsidering once it has real usage behind it and someone other than the
+author wants to install it.
 
 ## Quick start
 

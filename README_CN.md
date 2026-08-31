@@ -56,12 +56,31 @@ Claude adapter 有自动化测试覆盖，但没有在这里跑完一整轮真�
 ## 安装
 
 ```bash
-git clone https://github.com/AliceLJY/mutual-review-room.git
-cd mutual-review-room
-python3 -m pip install .
+uv tool install git+https://github.com/AliceLJY/mutual-review-room
 ```
 
-也可以在仓库内直接使用 `./scripts/mutual-review-room`。
+装完 `mutual-review-room` 就在 `PATH` 里，跑在独立环境中，不污染系统 Python。
+习惯 pipx 的话 `pipx install git+https://github.com/AliceLJY/mutual-review-room`
+等价。以后要换到新版本，同一条命令加 `--force` 重跑即可。
+
+也可以从仓库装或直接在仓库内跑：
+
+```bash
+git clone https://github.com/AliceLJY/mutual-review-room.git
+cd mutual-review-room
+python3 -m pip install .          # 需在 virtualenv 里
+./scripts/mutual-review-room      # 或者不装，直接就地运行
+```
+
+对着 Homebrew / 系统自带 Python 裸跑 `pip install .` 会被
+[PEP 668](https://peps.python.org/pep-0668/) 拒绝；请用 virtualenv 或上面两个
+工具安装器，不要用 `--break-system-packages` 硬来。
+
+**本项目有意不发布到 PyPI。** 从 git 直接装已经是一条命令的事，发上去只换来
+一个更短的名字，而 PyPI 的包名一旦上传就基本永久占用、收不回来。对一个这么
+年轻的东西来说这笔交易不划算：它只支持 macOS、还是 alpha，而且紧贴三个
+provider CLI 的具体参数和事件格式——上游随时可能改。等它积累了真实使用、
+并且开始有作者之外的人想装它，再重新考虑。
 
 ## 快速开始
 
