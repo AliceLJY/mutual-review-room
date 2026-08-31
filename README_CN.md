@@ -59,11 +59,17 @@ Claude 侧两个角色都没验成；2026-09-01 在 0.1.1 上分两轮补测完�
 `model_refusal_fallback`。终审 `complete` 一步也已验证：codex owner 写入
 verdict 后正常关闭 job。Claude reviewer 则测出实质问题：派发、作答、回传、
 状态结算的链路全部正常（作答约 75 秒），但它返回的是一段「我会把结论写进
-计划文件并请求批准」的过程叙述，零审查发现——`_claude_command` 给 reviewer
-硬编码的 `--permission-mode plan` 改变了 Claude 的应答形态（owner 侧同一
-参数只影响一次性的契约加载轮，交互式接管后无此限制，所以 owner 可用而
-reviewer 不可用）。在这个参数改掉并重新验证之前，请勿把 Claude 当 reviewer
-使用。
+计划文件并请求批准」的过程叙述，零审查发现。根因已用对照实验钉死：同一份
+任务信封、同样的 `--safe-mode --strict-mcp-config --tools ""`，仅去掉
+`--permission-mode plan` 重放一次，Claude 在 24 秒内直接给出两条正确发现
+（空序列除零、生成器无 `__len__`）。由于 `--safe-mode` 会禁用用户侧全部
+定制（CLAUDE.md、hooks、MCP、skills），上述行为是 Claude CLI 的原生行为，
+与测试机的本地配置无关。也就是说 Claude 本身是合格的 reviewer，唯一障碍是
+`_claude_command` 硬编码的 plan 模式——原生 plan 提醒会指示它「把计划写入
+文件并请求批准」，而 `--print` 下无人批准；只读性已由 `--tools ""` 与
+Seatbelt 保证，plan 模式在此纯属多余。owner 侧同一参数只影响一次性的契约
+加载轮（交互式接管后无此限制），所以 owner 可用而 reviewer 不可用。在该
+参数移除并重新验证之前，请勿把 Claude 当 reviewer 使用。
 
 ## 安装
 

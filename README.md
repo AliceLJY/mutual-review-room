@@ -63,12 +63,22 @@ is also verified: a codex owner wrote the verdict and closed the job cleanly.
 The Claude reviewer, however, surfaced a substantive problem: the plumbing —
 dispatch, answer, return, settlement — all works (the answer took ~75s), but
 the reply was a process statement ("I will write my conclusions into a plan
-file and request approval") with zero review findings. The hard-coded
-`--permission-mode plan` in `_claude_command` changes Claude's reply shape (on
-the owner side the same flag only affects the one-shot contract-load turn, and
-the interactive takeover has no such limit, which is why the owner works while
-the reviewer does not). Do not use Claude as a reviewer until that flag is
-changed and re-verified.
+file and request approval") with zero review findings. The root cause was
+pinned with a controlled replay: the same task envelope, the same
+`--safe-mode --strict-mcp-config --tools ""`, with only `--permission-mode
+plan` removed — Claude then returned two correct findings (empty-sequence
+division by zero, generator without `__len__`) in 24 seconds. Since
+`--safe-mode` disables all user-side customization (CLAUDE.md, hooks, MCP
+servers, skills), this is native Claude CLI behavior, not an artifact of the
+test machine's local configuration. In other words Claude is a perfectly
+capable reviewer; the only obstacle is the hard-coded plan mode — the native
+plan reminder instructs it to write a plan file and request approval, and
+under `--print` nobody is there to approve. Read-only safety is already
+enforced by `--tools ""` plus Seatbelt, so plan mode adds nothing here. On the
+owner side the same flag only affects the one-shot contract-load turn (the
+interactive takeover has no such limit), which is why the owner works while
+the reviewer does not. Do not use Claude as a reviewer until that flag is
+removed and re-verified.
 
 ## Install
 
