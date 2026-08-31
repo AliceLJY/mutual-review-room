@@ -39,11 +39,22 @@ rejects control connections to the outer tmux socket, and the design does not
 open a network or Unix-socket service.
 
 The owner's writable grant is one directory: the mailbox inbox. Everything the
-owner writes has to fit inside it, including the lock that orders enqueues, so
-that lock lives in the inbox rather than beside the broker's own lock and
-heartbeat. Placing it one level up would have forced the grant to widen to the
-whole mailbox, which would also hand the owner the broker's outbox and
-processing claims.
+owner *writes* has to fit inside it. The lock that orders enqueues is the one
+thing that must not: `flock` binds to an inode, so whoever can write the lock's
+directory can unlink or replace the entry and leave two submitters holding
+locks on two different inodes under the same name.
+
+The lock therefore stays at `<job>/broker/queue.lock`, outside the grant, and
+the two halves of using it are separated. `prepare_mailbox` creates it once,
+before any sandboxed process starts, and enforces its mode. A submitter then
+opens that existing file read-only and takes `flock` on the descriptor —
+`flock` needs an open descriptor, not a writable one, so this works from a
+sandbox that denies every write to the control root. A missing or non-private
+lock fails closed instead of being re-created by the submitter.
+
+The rejected alternative was widening the grant to the whole mailbox, which
+would also have handed the owner the broker's outbox, processing claims, and
+heartbeat.
 
 Commands split by whether they write. `status` is a pure read and runs directly
 against the job database, so it neither needs the broker nor queues behind a

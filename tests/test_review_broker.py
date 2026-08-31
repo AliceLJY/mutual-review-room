@@ -317,9 +317,16 @@ class ReviewBrokerTests(unittest.TestCase):
         self.assertEqual([], errors)
 
     def test_submitting_writes_only_inside_the_inbox(self) -> None:
-        """A sandboxed owner is given the inbox and nothing else to write."""
+        """A sandboxed owner is given the inbox and nothing else to write.
 
-        self.assertEqual(self.paths.inbox, self.paths.queue_lock.parent)
+        The enqueue lock deliberately sits outside that grant: whoever can
+        write the lock's directory can replace the entry and leave two
+        submitters holding locks on two different inodes. Taking it read-only
+        keeps the serialisation anchor somewhere the owner cannot touch.
+        """
+
+        self.assertEqual(self.paths.base, self.paths.queue_lock.parent)
+        self.assertNotEqual(self.paths.inbox, self.paths.queue_lock.parent)
 
         inbox_inode = self.paths.inbox.stat().st_ino
         writes: list[str] = []
@@ -342,7 +349,51 @@ class ReviewBrokerTests(unittest.TestCase):
 
         self.assertTrue(writes)
         self.assertEqual([], escaped, f"writes escaped the inbox: {escaped}")
-        self.assertIn(self.paths.queue_lock.name, writes)
+        # The lock was used, and used without any writable open.
+        self.assertNotIn(self.paths.queue_lock.name, writes)
+        self.assertTrue(self.paths.queue_lock.exists())
+
+    def test_submitting_fails_closed_without_a_prepared_lock(self) -> None:
+        """A missing lock must not be silently re-created by the submitter."""
+
+        self.paths.queue_lock.unlink()
+
+        with self.assertRaises(broker.MailboxSecurityError):
+            broker.submit(self.paths, self.token, "dispatch", {"round": 1})
+
+        self.assertFalse(self.paths.queue_lock.exists())
+        self.assertEqual([], broker._message_files(self.paths.inbox))
+
+    def test_submitting_rejects_an_unsafe_lock_entry(self) -> None:
+        for label, prepare in (
+            ("world readable", lambda: self.paths.queue_lock.chmod(0o644)),
+            ("symlink", self._replace_lock_with_symlink),
+            ("directory", self._replace_lock_with_directory),
+        ):
+            with self.subTest(lock=label):
+                self._reset_lock()
+                prepare()
+                with self.assertRaises(broker.MailboxSecurityError):
+                    broker.submit(self.paths, self.token, "dispatch", {"round": 1})
+        self._reset_lock()
+
+    def _reset_lock(self) -> None:
+        target = self.paths.queue_lock
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            target.rmdir()
+        broker._ensure_private_lock_file(self.paths.base, target.name)
+
+    def _replace_lock_with_symlink(self) -> None:
+        decoy = self.paths.base / "decoy.lock"
+        decoy.touch(mode=0o600)
+        self.paths.queue_lock.unlink()
+        self.paths.queue_lock.symlink_to(decoy)
+
+    def _replace_lock_with_directory(self) -> None:
+        self.paths.queue_lock.unlink()
+        self.paths.queue_lock.mkdir(mode=0o700)
 
     def test_the_queue_lock_is_not_mistaken_for_a_queued_request(self) -> None:
         request_id = broker.submit(self.paths, self.token, "dispatch", {"round": 1})

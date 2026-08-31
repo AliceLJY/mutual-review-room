@@ -174,6 +174,9 @@ def prepare_mailbox(
     for directory in (inbox, processing, outbox):
         _ensure_private_dir(directory)
     paths = _paths_for(root, job_id)
+    # Created here, where there is no sandbox, so that a sandboxed owner only
+    # ever has to open it read-only.
+    _ensure_private_lock_file(paths.base, paths.queue_lock.name)
     _validate_paths(paths)
     return paths
 
@@ -199,11 +202,15 @@ def _paths_for(root: Path, job_id: str) -> MailboxPaths:
         processing=base / "processing",
         outbox=base / "outbox",
         lock=base / "broker.lock",
-        # The enqueue lock lives beside the requests it orders so that a
-        # sandboxed owner needs write access to the inbox and nothing else.
-        # Widening the owner's writable set to the whole mailbox would also
-        # hand it the broker's own outbox, processing claims, and heartbeat.
-        queue_lock=inbox / "queue.lock",
+        # Deliberately outside the one directory a sandboxed owner may write.
+        # `flock` binds to an inode, so whoever can write the lock's *directory*
+        # can unlink or replace the entry and leave two submitters holding
+        # locks on different inodes. Keeping the entry where the owner cannot
+        # touch it makes that impossible without widening the owner's grant to
+        # the whole mailbox, which would also expose the broker's outbox,
+        # processing claims, and heartbeat. The owner never creates this file;
+        # it opens the existing one read-only, which needs no write permission.
+        queue_lock=base / "queue.lock",
         heartbeat=base / "heartbeat.json",
     )
 
@@ -234,7 +241,7 @@ def submit(
     }
     encoded = _encode_signed(body, key, MAX_REQUEST_BYTES)
     filename = _message_filename(request_id)
-    with _file_lock(paths.inbox, paths.queue_lock.name, blocking=True):
+    with _existing_file_lock(paths.base, paths.queue_lock.name, blocking=True):
         for directory in (paths.inbox, paths.processing, paths.outbox):
             if _entry_exists(directory, filename):
                 raise DuplicateMessageError(f"request already exists: {request_id}")
@@ -746,7 +753,7 @@ def _validate_paths(paths: MailboxPaths) -> None:
         paths.processing: paths.base,
         paths.outbox: paths.base,
         paths.lock: paths.base,
-        paths.queue_lock: paths.inbox,
+        paths.queue_lock: paths.base,
         paths.heartbeat: paths.base,
     }
     for path, parent in expected.items():
@@ -797,6 +804,78 @@ def _open_private_dir(path: Path, *, fix_mode: bool = False):
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _ensure_private_lock_file(directory: Path, name: str) -> None:
+    """Create the persistent lock entry, or verify an existing safe one.
+
+    Only callers outside the owner sandbox run this.  The file is never
+    removed afterwards: replacing the entry would let two holders lock two
+    different inodes under the same name.
+    """
+
+    directory_handle = _open_private_dir(directory)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=directory_handle.fileno())
+    except OSError as error:
+        raise MailboxSecurityError(f"mailbox lock is unsafe: {name}") from error
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise MailboxSecurityError(
+                f"mailbox lock is not a private regular file: {name}"
+            )
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+        directory_handle.close()
+
+
+@contextmanager
+def _existing_file_lock(
+    directory: Path, name: str, *, blocking: bool
+) -> Iterator[None]:
+    """Lock an already-created file without needing write access to it.
+
+    ``flock`` only needs an open descriptor, not a writable one, so a
+    sandboxed owner can serialise against a lock it is not allowed to create,
+    modify, or replace.  A missing or unsafe lock fails closed rather than
+    falling back to creating one in a directory the caller can write.
+    """
+
+    directory_handle = _open_private_dir(directory)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory_handle.fileno())
+        except OSError as error:
+            raise MailboxSecurityError(
+                f"mailbox lock is unavailable: {name}"
+            ) from error
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise MailboxSecurityError(
+                    f"mailbox lock is not a private regular file: {name}"
+                )
+            if stat.S_IMODE(info.st_mode) != 0o600:
+                raise MailboxSecurityError(f"mailbox lock is not mode 0600: {name}")
+            operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            try:
+                fcntl.flock(descriptor, operation)
+            except OSError as error:
+                if not blocking and error.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise BrokerAlreadyRunning("another broker owns this job") from error
+                raise
+            try:
+                yield
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+    finally:
+        directory_handle.close()
 
 
 @contextmanager
