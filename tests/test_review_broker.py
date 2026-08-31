@@ -210,10 +210,30 @@ class ReviewBrokerTests(unittest.TestCase):
 
         thread = threading.Thread(target=run_broker)
         thread.start()
+        self.addCleanup(release.set)
         self.assertTrue(entered.wait(1))
-        time.sleep(0.12)
-        heartbeat = json.loads(self.paths.heartbeat.read_text(encoding="utf-8"))
-        self.assertLess(time.time_ns() - heartbeat["updated_ns"], 80_000_000)
+
+        # The property under test is that the heartbeat keeps advancing while
+        # the handler blocks. Comparing two samples measures exactly that,
+        # whereas asserting the last write was under N milliseconds old also
+        # measures how promptly this machine schedules a daemon thread — which
+        # made this test fail on a loaded CI runner at 84ms against an 80ms
+        # budget. Both forms catch a heartbeat writer that dies; only this one
+        # is independent of machine speed.
+        def read_heartbeat() -> int:
+            payload = json.loads(self.paths.heartbeat.read_text(encoding="utf-8"))
+            return payload["updated_ns"]
+
+        first = read_heartbeat()
+        advanced = False
+        for _ in range(50):
+            time.sleep(0.02)
+            if read_heartbeat() > first:
+                advanced = True
+                break
+        self.assertTrue(advanced, "heartbeat stopped advancing while the handler was blocked")
+        self.assertLess(time.time_ns() - read_heartbeat(), 2_000_000_000)
+
         # No client wait remains connected; the broker still finishes the work.
         release.set()
         thread.join(2)
