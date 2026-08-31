@@ -12,6 +12,8 @@ review process without relaying messages yourself.
 │ owner                    │ reviewer kimi            │
 │                          ├──────────────────────────┤
 │ talk here                │ reviewer codex           │
+│                          ├──────────────────────────┤
+│                          │ reviewer claude          │
 └──────────────────────────┴──────────────────────────┘
 ```
 
@@ -109,13 +111,14 @@ Check which built-in providers are discoverable:
 mutual-review-room providers
 ```
 
-Open a room with a Codex owner and two reviewers:
+Open a room with a Codex owner and three reviewers:
 
 ```bash
 mutual-review-room launch \
   --owner codex \
   --reviewer kimi \
   --reviewer codex \
+  --reviewer claude \
   --cwd "$PWD"
 ```
 

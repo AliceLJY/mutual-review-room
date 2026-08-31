@@ -11,6 +11,8 @@ tmux 房间。你只在左侧和 owner 对话；右侧逐窗显示 reviewer 的�
 │ owner                    │ reviewer kimi            │
 │                          ├──────────────────────────┤
 │ 在这里对话               │ reviewer codex           │
+│                          ├──────────────────────────┤
+│                          │ reviewer claude          │
 └──────────────────────────┴──────────────────────────┘
 ```
 
@@ -101,13 +103,14 @@ provider CLI 的具体参数和事件格式——上游随时可能改。等它�
 mutual-review-room providers
 ```
 
-以 Codex 为 owner，同时打开 Kimi 和 Codex 两位 reviewer：
+以 Codex 为 owner，同时打开 Kimi、Codex、Claude 三位 reviewer：
 
 ```bash
 mutual-review-room launch \
   --owner codex \
   --reviewer kimi \
   --reviewer codex \
+  --reviewer claude \
   --cwd "$PWD"
 ```
 
