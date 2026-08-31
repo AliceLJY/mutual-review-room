@@ -48,7 +48,7 @@ adapter。
 | Kimi reviewer | 已验证 | 两轮，原生会话 ID 保持不变 |
 | Codex reviewer | 已验证 | 两轮，原生会话 ID 保持不变 |
 | Claude owner | 已验证 | 完整一轮：契约加载 2 秒照做、发出派发、终审 `complete`（0.1.2 实测）|
-| Claude reviewer | 已验证 | 一轮真实作答：20 秒给出两条正确发现（0.1.2 实测）|
+| Claude reviewer | 已验证 | 两轮，原生会话 ID 保持不变，第 2 轮正确复述第 1 轮内容（0.1.2 实测）|
 
 Claude adapter 有自动化测试覆盖。0.1.0 验收时该账号触发限流（HTTP 429），
 两个 Claude 角色都没验成；2026-09-01 在 0.1.1 上补测时发现 reviewer 只回

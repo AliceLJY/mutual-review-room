@@ -48,7 +48,7 @@ Not every provider role has been exercised against a live account. What the
 | Kimi reviewer | verified | two rounds, stable native session |
 | Codex reviewer | verified | two rounds, stable native session |
 | Claude owner | verified | full round: contract loaded in 2s as instructed, dispatch issued, final `complete` (retested on 0.1.2) |
-| Claude reviewer | verified | one live round: two correct findings in 20s (retested on 0.1.2) |
+| Claude reviewer | verified | two rounds, stable native session, round 2 correctly recalled round 1 (retested on 0.1.2) |
 
 The Claude adapter is exercised by the automated tests. During the 0.1.0
 acceptance run the account was rate-limited (HTTP 429), so neither Claude role
