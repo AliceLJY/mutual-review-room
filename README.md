@@ -40,8 +40,8 @@ This is a version-sensitive alpha: provider CLIs change flags and event schemas.
 | Kimi CLI | 0.39.1 |
 | tmux | 3.7b |
 
-Not every provider role has been exercised against a live account. What the
-0.1.0 acceptance run actually covered, on macOS 27 with those versions:
+Every provider role has been exercised against a live account, on macOS 27
+with those versions (the version each check ran on is noted per row):
 
 | Role | State | Basis |
 | --- | --- | --- |
